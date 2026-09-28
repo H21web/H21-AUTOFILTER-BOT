@@ -1,6 +1,7 @@
 # Pinned runtime dependencies (Python 3.11+).
 python-telegram-bot==21.6
 telethon>=1.36
+pyrogram>=2.0
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 SQLAlchemy==2.0.36
