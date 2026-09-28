@@ -23,13 +23,36 @@ class File(Base):
     caption: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     channel_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
     message_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    source_channel_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    """Original channel id when the file arrived via forward (backfill)."""
+    source_message_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    """Original message id in the source channel (backfill dedupe)."""
     quality: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     language: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     title_key: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     """Normalized title used for grouping files of the same movie."""
+    width: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    """Video width in px (from Telegram metadata, no download)."""
+    height: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    """Video height in px."""
+    duration: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    """Media duration in seconds."""
+    supports_streaming: Mapped[bool | None] = mapped_column(
+        sa.Boolean, nullable=True)
+    posted_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True)
+    """Original Telegram message date."""
+    views: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    """Channel post view count (MTProto only)."""
+    forwards: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    """Channel post forward count (MTProto only)."""
     search_vector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        sa.Index("ix_files_source", "source_channel_id", "source_message_id"),
     )
 
 
@@ -62,6 +85,48 @@ class SearchLog(Base):
 
     __table_args__ = (
         sa.Index("ix_search_logs_created_at", "created_at"),
+    )
+
+
+class BackfillJob(Base):
+    """One chunk of a channel backfill, claimed by a single indexer worker.
+
+    Jobs survive restarts: offset_id is checkpointed as the worker walks, so
+    a crash resumes mid-chunk instead of from the start.
+    """
+
+    __tablename__ = "backfill_jobs"
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    run_token: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    channel_ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    channel_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    channel_title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    min_id: Mapped[int] = mapped_column(sa.BigInteger, server_default="0", default=0, nullable=False)
+    max_id: Mapped[int] = mapped_column(sa.BigInteger, server_default="0", default=0, nullable=False)
+    skip: Mapped[int] = mapped_column(sa.Integer, server_default="0", default=0, nullable=False)
+    """Skip this many media files from the newest end (only on newest chunk)."""
+    status: Mapped[str] = mapped_column(
+        sa.Text, server_default="pending", default="pending", nullable=False
+    )  # pending | running | done | cancelled | error
+    offset_id: Mapped[int] = mapped_column(sa.BigInteger, server_default="0", default=0, nullable=False)
+    """Resume point: walk continues below this message id."""
+    worker: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    """Index of the indexer session working this job."""
+    stats: Mapped[dict] = mapped_column(
+        JSONB, server_default=sa.text("'{}'::jsonb"), default=dict, nullable=False
+    )
+    error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(),
+        onupdate=sa.func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        sa.Index("ix_backfill_jobs_run", "run_token", "status"),
     )
 
 

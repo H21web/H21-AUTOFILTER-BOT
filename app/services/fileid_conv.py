@@ -185,6 +185,32 @@ def to_bot_api(old_file_id: str) -> str:
     return _b64_encode(_rle_encode(bytes(buf)))
 
 
+def pack_bot_file_id_typed(file_type: int, dc_id: int, media_id: int,
+                           access_hash: int,
+                           file_reference: bytes | None) -> str | None:
+    """Pack a FRESH MTProto file into a Bot API file_id string.
+
+    Unlike telethon's ``pack_bot_file_id`` (which omits the file_reference
+    and which the Bot API rejects), this embeds the file_reference fetched
+    with the file, using the verified layout::
+
+        [type u32 | 1<<25][dc u32][fileref TL][id i64][access_hash i64][60][4]
+
+    Returns None when there is no file_reference -- without it the Bot API
+    cannot use the id ("can't unserialize it").
+    """
+    if not file_reference:
+        return None
+    buf = bytearray()
+    buf += struct.pack("<I", (file_type | _FILE_REFERENCE_FLAG) & 0xFFFFFFFF)
+    buf += struct.pack("<I", dc_id & 0xFFFFFFFF)
+    _pack_file_reference(buf, bytes(file_reference))
+    buf += struct.pack("<q", media_id)
+    buf += struct.pack("<q", access_hash)
+    buf += bytes([_SUB_VERSION, _VERSION])
+    return _b64_encode(_rle_encode(bytes(buf)))
+
+
 if __name__ == "__main__":
     # Self-test: legacy sample -> Bot API id -> decode and verify fields.
     sample = "BQADBAADbxIAAiI9kVE8STv1CqNIQhYE"
@@ -202,3 +228,16 @@ if __name__ == "__main__":
     assert d["file_reference"] == b""
     # Round-trip: decode(encode(x)) fields must match.
     print("OK: conversion round-trips through the Bot API decoder")
+
+    # Fresh pack: with a file_reference the id must decode back completely.
+    fake_ref = bytes(range(1, 32))
+    packed = pack_bot_file_id_typed(5, 4, 123456789, 987654321, fake_ref)
+    assert packed, "pack returned None"
+    d2 = decode_bot_api(packed)
+    assert d2["type"] == 5 and d2["dc_id"] == 4
+    assert d2["media_id"] == 123456789 and d2["access_hash"] == 987654321
+    assert d2["file_reference"] == fake_ref
+    assert d2["sub_version"] == 60 and d2["version"] == 4
+    assert pack_bot_file_id_typed(5, 4, 1, 1, None) is None
+    assert pack_bot_file_id_typed(5, 4, 1, 1, b"") is None
+    print("OK: fresh pack with file_reference round-trips")

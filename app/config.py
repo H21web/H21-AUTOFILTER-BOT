@@ -60,6 +60,24 @@ class Settings(BaseSettings):
     server-side auto-index feature is disabled. Generate it locally with
     make-session.py and paste the value into the host's env vars."""
 
+    TG_SESSIONS: str = ""
+    """Extra indexer sessions, comma- or newline-separated. Each session is
+    one parallel backfill worker (needs its own spare Telegram account).
+    Falls back to TG_SESSION when empty."""
+
+    BACKFILL_MODE: str = "direct"
+    """Backfill method: "direct" packs Bot API file_ids straight from
+    channel history (fastest, ~500-1000 files/sec/account, no PM flood);
+    "forward" forwards every file to the bot first (proven fallback)."""
+
+    BACKFILL_DELAY: float = 0.5
+    """Seconds between forwarded files, per indexer account (forward mode
+    only). Lower = faster but more FloodWaits; 0.5 is the safe sweet spot."""
+
+    BACKFILL_CHUNK: int = 200000
+    """Message-id range per backfill job. Smaller chunks = finer resume
+    granularity after a crash, more DB rows."""
+
     INDEX_CHANNELS: str = ""
     """Comma-separated channel ids whose new posts are auto-indexed,
     e.g. "-1001234567890,-1009876543210" (old MoovidexFilterBot CHANNELS
@@ -142,6 +160,15 @@ class Settings(BaseSettings):
             return int(self.LOG_CHANNEL.strip())
         except (ValueError, AttributeError):
             return None
+
+    @property
+    def tg_sessions(self) -> list[str]:
+        """All indexer sessions: TG_SESSIONS split, else [TG_SESSION]."""
+        raw = (self.TG_SESSIONS or "").replace("\n", ",")
+        sessions = [s.strip() for s in raw.split(",") if s.strip()]
+        if not sessions and self.TG_SESSION.strip():
+            sessions = [self.TG_SESSION.strip()]
+        return sessions
 
 
 settings = Settings()

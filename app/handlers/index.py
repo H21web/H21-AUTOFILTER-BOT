@@ -35,7 +35,7 @@ from telegram.ext import (
 
 from app.config import settings
 from app.db import get_session_factory
-from app.handlers.common import admin_only, effective_main_channel, is_admin
+from app.handlers.common import effective_main_channel, is_admin
 from app.models import File
 from app.services.textutil import (
     clean_title,
@@ -83,9 +83,12 @@ async def _alert_log_channel(bot, text: str) -> None:
         log.warning("could not alert LOG_CHANNEL: %s", exc)
 
 
-async def save_file(msg, doc, bot=None) -> tuple[str, str, bool]:
+async def save_file(msg, doc, bot=None, source_channel_id=None,
+                  source_message_id=None, quiet=False) -> tuple[str, str, bool]:
     """Old-bot style save: validate -> duplicate check -> insert.
 
+    source_channel_id/message_id track where a forwarded file came from
+    (backfill dedupe). quiet=True skips the new-title alert (backfill floods).
     Returns (status, file_name, is_new_title); status is one of:
         "saved"     - new row inserted
         "duplicate" - file_id already in DB, skipped without saving
@@ -125,9 +128,19 @@ async def save_file(msg, doc, bot=None) -> tuple[str, str, bool]:
                 caption=caption or None,
                 channel_id=msg.chat_id,
                 message_id=msg.message_id,
+                source_channel_id=source_channel_id,
+                source_message_id=source_message_id,
                 quality=quality,
                 language=language,
                 title_key=tk or None,
+                width=getattr(doc, "width", None),
+                height=getattr(doc, "height", None),
+                duration=getattr(doc, "duration", None),
+                supports_streaming=getattr(doc, "supports_streaming", None),
+                posted_at=getattr(msg, "date", None),
+                # views/forwards only exist via MTProto, not the Bot API
+                views=None,
+                forwards=None,
             ).on_conflict_do_nothing(index_elements=["file_id"])
             result = await session.execute(stmt)
             await session.commit()
@@ -136,7 +149,8 @@ async def save_file(msg, doc, bot=None) -> tuple[str, str, bool]:
                 log.debug("auto-index skip duplicate (race) %r", file_name)
                 return "duplicate", file_name, False
             log.debug("auto-index saved %r", file_name)
-            new_title = bool(tk) and await _is_new_title(session, tk, file_id)
+            new_title = ((not quiet) and bool(tk)
+                         and await _is_new_title(session, tk, file_id))
             return "saved", file_name, bool(new_title)
     except Exception as exc:  # noqa: BLE001
         log.warning("auto-index DB error for %r: %s", file_name, exc)
@@ -262,14 +276,30 @@ async def on_admin_pm_media(update: Update,
     if doc is None:
         return
 
-    status, file_name, new_title = await save_file(msg, doc,
-                                                     bot=context.bot)
+    # Backfill floods come from the indexer account(s): extract the original
+    # channel/message from the forward header for source tracking, save
+    # quietly (no per-file alerts/counters at 2+ files/sec).
+    is_backfill = bool(uid and uid in settings.indexer_ids)
+    src_ch, src_msg_id = None, None
+    fo = getattr(msg, "forward_origin", None)
+    if fo is not None and getattr(fo, "type", None) == "channel":
+        chat = getattr(fo, "chat", None)
+        if chat is not None:
+            src_ch, src_msg_id = chat.id, getattr(fo, "message_id", None)
+
+    status, file_name, new_title = await save_file(
+        msg, doc, bot=context.bot,
+        source_channel_id=src_ch, source_message_id=src_msg_id,
+        quiet=is_backfill)
     if status == "saved" and new_title:
         await _post_new_movie_alert(context.bot, file_name)
 
     data = context.chat_data
     data["idx_count"] = data.get("idx_count", 0) + 1
     n = data["idx_count"]
+    # throttle counter edits during backfill floods (every 25 files)
+    if is_backfill and n % 25:
+        return
     old_task = data.get("idx_task")
     if old_task and not old_task.done():
         old_task.cancel()
@@ -288,20 +318,25 @@ async def on_admin_pm_media(update: Update,
         _finalize_index_summary(context.bot, msg.chat_id, data))
 
 
-@admin_only
 async def index_command(update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/index — control panel; /index <channel> for a quick backfill.
+    """/index — admin: control panel (or /index <channel> quick backfill).
 
-    The panel queues channels and sets skip / message-range / max-files
-    options. Starting launches the server-side MTProto backfill
-    (needs TG_SESSION configured) with live progress and cancel.
+    Non-admins (PM only): request a channel for indexing — moderators
+    approve/reject in LOG_CHANNEL.
     """
+    user = update.effective_user
+    uid = user.id if user else 0
+    if not is_admin(uid):
+        if update.effective_chat.type != "private":
+            await update.effective_message.reply_text(
+                "💡 <i>PM-il vannu /index adicholu.</i>", parse_mode="HTML")
+            return
+        await _start_index_request(update, context)
+        return
     if context.args:
         await _quick_index_flow(update, context, " ".join(context.args))
         return
-    user = update.effective_user
-    uid = user.id if user else 0
     text, kb = await _panel_data(uid)
     msg = await update.effective_message.reply_text(
         text, parse_mode="HTML", reply_markup=kb)
@@ -401,32 +436,6 @@ def _bar(pct: float, width: int = 12) -> str:
     return "▓" * fill + "░" * (width - fill)
 
 
-def _stats_text(s: dict, title: str | None = None, ch_idx: int = 0,
-                ch_total: int = 1, started: float = 0.0,
-                cfg: dict | None = None) -> str:
-    """Live progress card for a backfill run."""
-    lines = ["📥 <b>Indexing…</b>"]
-    if ch_total > 1:
-        lines.append(f"📡 Channel {ch_idx + 1}/{ch_total}")
-    if title:
-        lines.append(f"📌 {_html.escape(title)}")
-    lines.append("")
-    if cfg and cfg.get("limit"):
-        pct = s["forwarded"] / cfg["limit"]
-        lines.append(f"{_bar(pct)} <b>{pct * 100:.0f}%</b>")
-        lines.append("")
-    lines.append(f"📨 Forwarded: <b>{s['forwarded']}</b>")
-    lines.append(f"⏭️ Skipped: <b>{s['skipped']}</b>")
-    lines.append(f"❌ Errors: <b>{s['errors']}</b>")
-    if started:
-        el = _time.monotonic() - started
-        rate = s["forwarded"] / (el / 60) if el > 5 else 0
-        lines.append(f"\n⏱ {int(el // 60)}m {int(el % 60):02d}s • ⚡ {rate:.0f}/min")
-    if s.get("cancelled"):
-        lines.append("\n🛑 <i>Cancelled.</i>")
-    return "\n".join(lines)
-
-
 async def _quick_index_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
                             raw_ref: str) -> None:
     """Resolve one channel and ask for confirmation (admin only)."""
@@ -461,7 +470,7 @@ async def _quick_index_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"🆔 <code>{info['chat_id']}</code>\n"
         f"🔢 Last message: <b>{last}</b>\n\n"
         f"{_cfg_summary(cfg)}\n\n"
-        "<i>Every video/audio/document will be forwarded to me and indexed. "
+        "<i>Every video/audio/document will be indexed directly from history. "
         "Change skip/range/limit from the /index panel first if needed.</i>",
         parse_mode="HTML", reply_markup=kb)
 
@@ -481,11 +490,68 @@ async def _on_index_callback(update: Update,
     arg = parts[2] if len(parts) > 2 else ""
 
     if action == "cancel":
-        # cancel a running backfill
+        # cancel a running backfill (workers + DB jobs)
+        from app.services import mtproto_index
         run = _INDEX_RUNS.get(arg)
         if run:
             run["event"].set()
-            await query.answer("Cancelling…", show_alert=True)
+        try:
+            await mtproto_index.cancel_run(arg)
+        except Exception:  # noqa: BLE001
+            pass
+        await query.answer("Cancelling…", show_alert=True)
+        return
+
+    if action in ("reqaccept", "reqreject"):
+        # moderator decision on a user-submitted index request
+        req = _REQ_INDEX.pop(arg, None)
+        if not req:
+            await query.answer("⚠️ Expired.", show_alert=True)
+            return
+        mod = (update.effective_user.full_name
+               if update.effective_user else "moderator")
+        title = req["title"]
+        if action == "reqreject":
+            try:
+                await query.edit_message_text(
+                    f"❌ <b>Rejected</b> by {_html.escape(mod)}\n"
+                    f"📌 {_html.escape(title)}",
+                    parse_mode="HTML")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await context.bot.send_message(
+                    req["from_user"],
+                    f"❌ Your indexing request for <b>{_html.escape(title)}</b> "
+                    f"was declined by the moderators.",
+                    parse_mode="HTML")
+            except Exception:  # noqa: BLE001
+                pass
+            await query.answer("Rejected.")
+            return
+        # accepted: queue the channel into the parallel backfill engine
+        try:
+            await query.edit_message_text(
+                f"✅ <b>Accepted</b> by {_html.escape(mod)} — indexing…\n"
+                f"📌 {_html.escape(title)}",
+                parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await context.bot.send_message(
+                req["from_user"],
+                f"✅ Your request for <b>{_html.escape(title)}</b> was "
+                f"<b>accepted</b>! Files will be indexed soon.",
+                parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        token = _secrets.token_hex(4)
+        await query.answer("Accepted — starting backfill.")
+        await _begin_backfill(
+            context, token, [req["ref"]],
+            {"channels": [req["ref"]], "skip": 0, "from_id": 0,
+             "to_id": 0, "limit": 0},
+            chat_id=settings.log_channel_id)
         return
 
     cfg = _get_cfg(uid)
@@ -583,7 +649,7 @@ async def _on_index_callback(update: Update,
         ])
         await query.edit_message_text(
             f"📥 <b>Start backfill?</b>\n\n{ch_lines}\n\n{_cfg_summary(cfg)}\n\n"
-            "<i>Media will be forwarded to me and indexed.</i>",
+            "<i>Media will be indexed directly from history.</i>",
             parse_mode="HTML", reply_markup=kb)
         return
 
@@ -679,12 +745,13 @@ async def _on_idx_text_input(update: Update,
 
 async def _on_idx_cancel_cmd(update: Update,
                              context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Abort a pending /index settings input."""
+    """Abort a pending /index settings input or index request."""
     user = update.effective_user
     uid = user.id if user else None
-    if not uid or uid not in _IDX_AWAIT:
+    if not uid or (uid not in _IDX_AWAIT and uid not in _REQ_AWAIT):
         return
     _IDX_AWAIT.pop(uid, None)
+    _REQ_AWAIT.discard(uid)
     await update.effective_message.reply_text("🚫 <i>Input cancelled.</i>",
                                               parse_mode="HTML")
     panel = _IDX_PANEL.get(uid)
@@ -698,95 +765,274 @@ async def _on_idx_cancel_cmd(update: Update,
             pass
 
 
-async def _launch_index_run(query, context: ContextTypes.DEFAULT_TYPE,
-                            token: str, channels: list, cfg: dict) -> None:
+# --------------------------------- moderator approval workflow ---
+
+_REQ_AWAIT: set[int] = set()      # user ids composing an index request
+_REQ_INDEX: dict[str, dict] = {}  # token -> pending request
+
+
+async def _start_index_request(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Non-admin /index (PM): ask for the channel to request."""
     from app.services import mtproto_index
-    try:
-        me = await context.bot.get_me()
-        bot_username = "@" + (me.username or "")
-    except Exception:  # noqa: BLE001
-        bot_username = ""
-    if not bot_username or bot_username == "@":
-        await query.edit_message_text(
-            "❌ <i>Bot has no username — set one in BotFather.</i>",
+    user = update.effective_user
+    uid = user.id if user else 0
+    msg = update.effective_message
+    if not mtproto_index.indexer_configured():
+        await msg.reply_text(
+            "⚠️ <i>Indexing isn't set up on the server yet — try again later.</i>",
             parse_mode="HTML")
         return
+    if not settings.log_channel_id:
+        await msg.reply_text(
+            "⚠️ <i>Index requests aren't set up yet (no LOG_CHANNEL).</i>",
+            parse_mode="HTML")
+        return
+    _REQ_AWAIT.add(uid)
+    await msg.reply_text(
+        "📥 <b>Request a channel for indexing</b>\n\n"
+        "Send the channel's <b>last post link</b> "
+        "(e.g. <code>t.me/c/123…/456</code>),\n"
+        "or simply <b>forward any message</b> from that channel here.\n\n"
+        "Moderators will review it. /cancel to abort.",
+        parse_mode="HTML")
+
+
+class _ReqAwaitFilter(filters.MessageFilter):
+    """Matches PM text/forwards while the user is composing an index request."""
+
+    def filter(self, message) -> bool:
+        u = message.from_user
+        return bool(u and u.id in _REQ_AWAIT
+                    and (message.text or message.forward_from_chat))
+
+
+async def _on_req_input(update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Consume one index-request input (link or forwarded channel message)."""
+    from app.services import mtproto_index
+    user = update.effective_user
+    uid = user.id if user else 0
+    msg = update.effective_message
+    _REQ_AWAIT.discard(uid)
+
+    ref = None
+    if msg.forward_from_chat and getattr(msg.forward_from_chat, "type",
+                                         None) == "channel":
+        fwd = msg.forward_from_chat
+        ref = f"@{fwd.username}" if getattr(fwd, "username", None) else str(fwd.id)
+    elif msg.text:
+        ref, _ = mtproto_index.parse_channel_ref(msg.text)
+    if not ref:
+        await msg.reply_text("❌ <i>Send a channel link or forward a "
+                             "channel message. Try /index again.</i>",
+                             parse_mode="HTML")
+        return
+    try:
+        info = await mtproto_index.resolve_channel(ref)
+    except Exception as exc:  # noqa: BLE001
+        await msg.reply_text(
+            f"❌ Couldn't read that channel: "
+            f"<code>{_html.escape(str(exc))}</code>\n"
+            f"<i>Try /index again.</i>", parse_mode="HTML")
+        return
+
+    token = _secrets.token_hex(4)
+    _REQ_INDEX[token] = {
+        "ref": ref, "title": info["title"], "chat_id": info["chat_id"],
+        "last_msg_id": info["last_msg_id"],
+        "from_user": uid,
+        "from_name": (user.full_name if user else str(uid)),
+    }
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Accept & index",
+                              callback_data=f"idx:reqaccept:{token}")],
+        [InlineKeyboardButton("❌ Reject",
+                              callback_data=f"idx:reqreject:{token}")],
+    ])
+    try:
+        await context.bot.send_message(
+            settings.log_channel_id,
+            f"#IndexRequest\n\n"
+            f"By: {_html.escape(_REQ_INDEX[token]['from_name'])} "
+            f"(<code>{uid}</code>)\n"
+            f"📌 {_html.escape(info['title'])}\n"
+            f"🆔 <code>{_html.escape(ref)}</code>\n"
+            f"🔢 Last message: <b>{info['last_msg_id']}</b>",
+            parse_mode="HTML", reply_markup=kb)
+    except Exception as exc:  # noqa: BLE001
+        _REQ_INDEX.pop(token, None)
+        await msg.reply_text(
+            f"❌ Couldn't forward the request to moderators: "
+            f"<code>{_html.escape(str(exc))}</code>", parse_mode="HTML")
+        return
+    await msg.reply_text(
+        "✅ <b>Request sent!</b>\nModerators will review it — "
+        "I'll notify you of the decision.", parse_mode="HTML")
+
+
+def _agg_text(agg: dict, started: float = 0.0,
+              cfg: dict | None = None, workers: int = 0) -> str:
+    """Live progress card for a parallel backfill run (DB-aggregated)."""
+    lines = ["📥 <b>Backfill running…</b>"]
+    if agg.get("titles"):
+        shown = ", ".join(agg["titles"][:3])
+        more = "…" if len(agg["titles"]) > 3 else ""
+        lines.append(f"📌 {_html.escape(shown)}{more}")
+    if workers:
+        lines.append(f"👷 Workers: <b>{workers}</b>")
+    lines.append("")
+    if cfg and cfg.get("limit"):
+        pct = min(1.0, agg["saved"] / cfg["limit"])
+        lines.append(f"{_bar(pct)} <b>{pct * 100:.0f}%</b>")
+        lines.append("")
+    lines.append(f"💾 Saved: <b>{agg['saved']}</b>")
+    lines.append(f"⏭️ Skipped: <b>{agg['skipped']}</b>")
+    if agg.get("dupes"):
+        lines.append(f"♻️ Already indexed: <b>{agg['dupes']}</b>")
+    lines.append(f"❌ Errors: <b>{agg['errors']}</b>")
+    if agg.get("last_error"):
+        lines.append(f"⚠️ <code>{_html.escape(agg['last_error'][:180])}</code>")
+    finished = agg.get("done", 0) + agg.get("cancelled", 0) + agg.get("error", 0)
+    lines.append(f"🧩 Jobs: <b>{finished}/{agg.get('total', 0)}</b> done")
+    if started:
+        el = _time.monotonic() - started
+        rate = agg["saved"] / (el / 60) if el > 5 else 0
+        lines.append(f"\n⏱ {int(el // 60)}m {int(el % 60):02d}s"
+                     f" • ⚡ {rate:.0f}/min")
+    return "\n".join(lines)
+
+
+async def _begin_backfill(context: ContextTypes.DEFAULT_TYPE, token: str,
+                          channels: list, cfg: dict, chat_id: int,
+                          edit_msg_id: int | None = None) -> None:
+    """Create chunked jobs and launch the parallel backfill engine.
+
+    Shared by the /index panel flow and accepted moderator requests.
+    Progress is shown by editing one status message (existing or new).
+    """
+    from app.services import mtproto_index
+    mode = mtproto_index.backfill_mode()
+    # direct mode packs file_ids from history — no bot username needed.
+    # forward mode needs the bot's username to forward files to it.
+    bot_username = ""
+    if mode == "forward":
+        try:
+            me = await context.bot.get_me()
+            bot_username = "@" + (me.username or "")
+        except Exception:  # noqa: BLE001
+            bot_username = ""
+        if not bot_username or bot_username == "@":
+            await context.bot.send_message(
+                chat_id,
+                "❌ <i>Bot has no username — set one in BotFather.</i>",
+                parse_mode="HTML")
+            return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Cancel", callback_data=f"idx:cancel:{token}")]])
     cancel_event = asyncio.Event()
-    chat_id = query.message.chat_id
-    status = await query.edit_message_text(
-        "📥 <b>Indexing… starting</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🛑 Cancel", callback_data=f"idx:cancel:{token}")]]))
+    if edit_msg_id:
+        await context.bot.edit_message_text(
+            "📥 <b>Indexing… starting</b>", chat_id=chat_id,
+            message_id=edit_msg_id, parse_mode="HTML", reply_markup=kb)
+        status_id = edit_msg_id
+    else:
+        status = await context.bot.send_message(
+            chat_id, "📥 <b>Indexing… starting</b>",
+            parse_mode="HTML", reply_markup=kb)
+        status_id = status.message_id
     run = {"event": cancel_event, "chat_id": chat_id,
-           "msg_id": status.message_id, "start": _time.monotonic()}
+           "msg_id": status_id, "start": _time.monotonic(),
+           "token": token}
     _INDEX_RUNS[token] = run
 
-    async def push(stats: dict, title: str, ch_idx: int) -> None:
+    try:
+        created = await mtproto_index.create_jobs(
+            token, channels, skip=cfg["skip"],
+            from_id=cfg["from_id"], to_id=cfg["to_id"])
+    except Exception as exc:  # noqa: BLE001
+        _INDEX_RUNS.pop(token, None)
         try:
             await context.bot.edit_message_text(
-                _stats_text(stats, title=title, ch_idx=ch_idx,
-                            ch_total=len(channels), started=run["start"],
-                            cfg=cfg),
-                chat_id=chat_id, message_id=run["msg_id"], parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "🛑 Cancel", callback_data=f"idx:cancel:{token}")]]))
+                f"❌ <b>Couldn't start:</b> "
+                f"<code>{_html.escape(str(exc))}</code>",
+                chat_id=chat_id, message_id=status_id, parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if not created["jobs"]:
+        _INDEX_RUNS.pop(token, None)
+        try:
+            await context.bot.edit_message_text(
+                "ℹ️ <i>Nothing to index — channels are empty or out of range.</i>",
+                chat_id=chat_id, message_id=status_id, parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    workers = mtproto_index.session_count()
+
+    async def push(agg: dict) -> None:
+        try:
+            await context.bot.edit_message_text(
+                _agg_text(agg, started=run["start"], cfg=cfg,
+                          workers=workers),
+                chat_id=chat_id, message_id=status_id, parse_mode="HTML",
+                reply_markup=kb)
         except Exception:  # noqa: BLE001
             pass
 
     async def runner() -> None:
-        totals = {"scanned": 0, "forwarded": 0, "skipped": 0, "errors": 0,
-                  "cancelled": False, "limit_hit": False}
         try:
-            remaining = cfg["limit"] or 0
-            for i, ref in enumerate(channels):
-                if cancel_event.is_set():
-                    totals["cancelled"] = True
-                    break
-                try:
-                    info = await mtproto_index.resolve_channel(ref)
-                    title = info["title"]
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("index: resolve failed for %s: %s", ref, exc)
-                    totals["errors"] += 1
-                    continue
-                stats = await mtproto_index.walk_and_forward(
-                    ref, info["last_msg_id"], bot_username, cancel_event,
-                    progress_cb=lambda s, t=title, d=i: push(s, t, d),
-                    skip=cfg["skip"], min_id=cfg["from_id"],
-                    max_id=cfg["to_id"], limit=remaining)
-                for k in ("scanned", "forwarded", "skipped", "errors"):
-                    totals[k] += stats[k]
-                if remaining:
-                    remaining = max(0, remaining - stats["forwarded"])
-                if stats.get("cancelled"):
-                    totals["cancelled"] = True
-                    break
-                if stats.get("limit_hit"):
-                    totals["limit_hit"] = True
-                    break
+            totals = await mtproto_index.run_backfill(
+                token, bot_username, cancel_event, progress_cb=push,
+                limit=cfg["limit"] or 0)
         except Exception as exc:  # noqa: BLE001
-            totals["fatal"] = str(exc)
+            totals = {"fatal": str(exc), "saved": 0}
         _INDEX_RUNS.pop(token, None)
         if totals.get("fatal"):
             tail = (f"❌ <b>Failed:</b> "
                     f"<code>{_html.escape(totals['fatal'])}</code>")
-        elif totals["cancelled"]:
+        elif totals.get("cancelled"):
             tail = "🛑 <i>Cancelled.</i>"
-        elif totals["limit_hit"]:
+        elif totals.get("limit_hit"):
             tail = "✅ <b>Done — file limit reached.</b>"
         else:
             tail = "✅ <b>Done.</b>"
+        final = (f"📥 <b>Backfill finished</b> ({totals.get('mode', '?')} mode)\n\n"
+                 f"💾 Saved: <b>{totals.get('saved', 0)}</b>\n"
+                 f"⏭️ Skipped: <b>{totals.get('skipped', 0)}</b>\n"
+                 f"♻️ Already indexed: <b>{totals.get('dupes', 0)}</b>\n"
+                 f"❌ Errors: <b>{totals.get('errors', 0)}</b>\n"
+                 f"👷 Workers: <b>{totals.get('workers', workers)}</b>\n\n"
+                 f"{tail}")
+        if totals.get("errors"):
+            try:
+                errs = await mtproto_index.job_errors(token)
+            except Exception:  # noqa: BLE001
+                errs = []
+            if errs:
+                detail = "\n".join(
+                    f"• {_html.escape((e['title'] or '?')[:40])}: "
+                    f"<code>{_html.escape((e['error'] or '')[:180])}</code>"
+                    for e in errs)
+                final += f"\n\n⚠️ <b>What failed:</b>\n{detail}"
+        final += "\n\n<i>Send /index for the new total.</i>"
         try:
             await context.bot.edit_message_text(
-                _stats_text(totals, started=run["start"], cfg=cfg)
-                + f"\n\n{tail}\n\n<i>Send /index for the new total.</i>",
-                chat_id=chat_id, message_id=run["msg_id"], parse_mode="HTML")
+                final, chat_id=chat_id, message_id=status_id,
+                parse_mode="HTML")
         except Exception:  # noqa: BLE001
             pass
 
     run["task"] = asyncio.create_task(runner())
+
+
+async def _launch_index_run(query, context: ContextTypes.DEFAULT_TYPE,
+                            token: str, channels: list, cfg: dict) -> None:
+    """Panel 'go' entry point — edits the confirmation message in place."""
+    await _begin_backfill(context, token, channels, cfg,
+                          query.message.chat_id,
+                          edit_msg_id=query.message.message_id)
 
 
 def register(application: Application) -> None:
@@ -802,6 +1048,10 @@ def register(application: Application) -> None:
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
         & _AwaitingFilter(),
         _on_idx_text_input,
+    ))
+    application.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND & _ReqAwaitFilter(),
+        _on_req_input,
     ))
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.ATTACHMENT,
