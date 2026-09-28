@@ -190,14 +190,67 @@ async def deliver_file(bot, chat_id: int, user_id: int, file_db_id: int,
         ])
 
     try:
-        await bot.send_document(
-            chat_id=chat_id,
-            document=row["file_id"],
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=kb,
-            reply_to_message_id=reply_to,
-        )
+        if settings.INDEXER_BOT_MODE:
+            from app.services.mtproto_index import get_pyro_client
+            from pyrogram import enums
+            from pyrogram.types import InlineKeyboardMarkup as PyroInlineKeyboardMarkup
+            from pyrogram.types import InlineKeyboardButton as PyroInlineKeyboardButton
+            from pyrogram.types import WebAppInfo as PyroWebAppInfo
+            from pyrogram.raw.types import InputPeerUser, InputPeerChat, InputPeerChannel
+            import pyrogram.utils
+
+            pyro = await get_pyro_client()
+            
+            if chat_id > 0:
+                peer = InputPeerUser(user_id=chat_id, access_hash=0)
+            elif str(chat_id).startswith("-100"):
+                peer = InputPeerChannel(channel_id=pyrogram.utils.get_channel_id(chat_id), access_hash=0)
+            else:
+                peer = InputPeerChat(chat_id=-chat_id)
+
+            pyro_kb = None
+            if kb:
+                pyro_rows = []
+                for ptb_row in kb.inline_keyboard:
+                    pyro_btn_row = []
+                    for btn in ptb_row:
+                        pyro_btn_row.append(PyroInlineKeyboardButton(
+                            text=btn.text,
+                            url=btn.url,
+                            callback_data=btn.callback_data,
+                            web_app=PyroWebAppInfo(url=btn.web_app.url) if btn.web_app else None
+                        ))
+                    pyro_rows.append(pyro_btn_row)
+                pyro_kb = PyroInlineKeyboardMarkup(pyro_rows)
+
+            try:
+                await pyro.send_document(
+                    chat_id=peer,
+                    document=row["file_id"],
+                    caption=caption,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=pyro_kb,
+                    reply_to_message_id=reply_to,
+                )
+            except Exception as pyro_exc:
+                log.warning("pyro.send_document failed, falling back to bot.send_document: %s", pyro_exc)
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=row["file_id"],
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    reply_to_message_id=reply_to,
+                )
+        else:
+            await bot.send_document(
+                chat_id=chat_id,
+                document=row["file_id"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=kb,
+                reply_to_message_id=reply_to,
+            )
     except Forbidden:
         log.info("forbidden sending to %s", chat_id)
     except BadRequest as exc:
