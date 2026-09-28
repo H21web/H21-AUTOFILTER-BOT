@@ -525,16 +525,90 @@ async def _walk_job_direct(client, factory, job: dict, ctx: dict) -> dict:
     return stats
 
 
+def _pyro_raw_file_id(raw_doc) -> str | None:
+    """Build a guaranteed-complete Pyrogram Bot API file_id directly from a
+    raw MTProto Document object (pyrogram.raw.types.Document).
+
+    The high-level ``m.document.file_id`` can produce a truncated file_id
+    when the in_memory Pyrogram bot client hasn't cached the peer's full
+    access_hash. Going via the raw document fields avoids this entirely:
+    Telegram ALWAYS sends dc_id, id, access_hash and file_reference in
+    GetHistory responses — these fields are never partial.
+    """
+    try:
+        from pyrogram.file_id import FileId, FileType
+        from pyrogram import raw as pyro_raw
+        if not isinstance(raw_doc, pyro_raw.types.Document):
+            return None
+        if not raw_doc.file_reference:
+            return None
+        fid = FileId(
+            file_type=FileType.DOCUMENT,
+            dc_id=raw_doc.dc_id,
+            media_id=raw_doc.id,
+            access_hash=raw_doc.access_hash,
+            file_reference=bytes(raw_doc.file_reference),
+        )
+        return fid.encode()
+    except Exception as e:  # noqa: BLE001
+        log.debug("_pyro_raw_file_id failed: %s", e)
+        return None
+
+
 def _pyro_media(msg) -> dict | None:
     """Extract (file_id, file_name, file_size, mime_type, w, h, dur) from a
-    Pyrogram message. file_id is ALREADY the Bot API file_id — no packing.
+    Pyrogram message.
+
+    Builds the file_id from the RAW MTProto document fields (dc_id, id,
+    access_hash, file_reference) so it is always complete and guaranteed
+    to be accepted by the Bot API. The high-level m.document.file_id can be
+    truncated when the in_memory bot client has an incomplete peer cache.
     """
+    # Try to get the raw document from the message's _raw attribute first
+    # (present on all Pyrogram messages received from Telegram).
+    raw_msg = getattr(msg, "_raw", None)
+    raw_media = getattr(raw_msg, "media", None) if raw_msg else None
+    raw_doc = getattr(raw_media, "document", None) if raw_media else None
+
+    if raw_doc is not None:
+        built_fid = _pyro_raw_file_id(raw_doc)
+        if built_fid:
+            # Gather metadata from the high-level object where available
+            for attr in ("document", "video", "audio", "animation", "voice",
+                         "video_note", "sticker"):
+                hi = getattr(msg, attr, None)
+                if hi is not None:
+                    return {
+                        "file_id": built_fid,
+                        "file_name": getattr(hi, "file_name", None),
+                        "file_size": getattr(hi, "file_size", None),
+                        "mime_type": getattr(hi, "mime_type", None),
+                        "width": getattr(hi, "width", None),
+                        "height": getattr(hi, "height", None),
+                        "duration": getattr(hi, "duration", None),
+                    }
+            # Fallback: gather metadata from raw document
+            return {
+                "file_id": built_fid,
+                "file_name": None,
+                "file_size": getattr(raw_doc, "size", None),
+                "mime_type": getattr(raw_doc, "mime_type", None),
+                "width": None,
+                "height": None,
+                "duration": None,
+            }
+
+    # Fallback: use the high-level file_id (may be partial for some edge cases)
     for attr in ("document", "video", "audio", "animation", "voice",
                  "video_note", "sticker", "photo"):
         m = getattr(msg, attr, None)
         if m is not None:
+            fid = getattr(m, "file_id", None)
+            if not fid:
+                continue
+            log.debug("_pyro_media: using fallback high-level file_id for %s", attr)
             return {
-                "file_id": m.file_id,
+                "file_id": fid,
                 "file_name": getattr(m, "file_name", None),
                 "file_size": getattr(m, "file_size", None),
                 "mime_type": getattr(m, "mime_type", None),
