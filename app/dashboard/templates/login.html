@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Login{% endblock %}
+{% block content %}
+<div class="login-wrap">
+  <h1>🎬 Admin Login</h1>
+  {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+  {% if not enabled %}
+    <div class="alert">Dashboard login is disabled. Set <span class="mono">ADMIN_PASSWORD</span> on the server and restart.</div>
+  {% else %}
+  <form method="post" action="{{ url_for('admin_login') }}">
+    <label>Username</label>
+    <input type="text" name="username" autocomplete="username" required>
+    <label>Password</label>
+    <input type="password" name="password" autocomplete="current-password" required>
+    <button class="btn" type="submit" style="width:100%">Login</button>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<h1>👥 Users <small style="color:var(--mut);font-size:.9rem">({{ total }} total, {{ banned }} banned)</small></h1>
+<table>
+  <tr><th>User ID</th><th>Name</th><th>Status</th><th>Joined</th><th></th></tr>
+  {% for u in users %}
+  <tr>
+    <td class="mono">{{ u.user_id }}</td>
+    <td>{{ u.full_name or '—' }}</td>
+    <td>{% if u.banned %}<span class="badge bad">banned</span>{% else %}<span class="badge ok">active</span>{% endif %}</td>
+    <td class="mono">{{ u.created_at.strftime('%Y-%m-%d') if u.created_at else '—' }}</td>
+    <td>
+      <form class="inline" method="post" action="/admin/users/ban">
+        <input type="hidden" name="user_id" value="{{ u.user_id }}">
+        {% if u.banned %}
+        <input type="hidden" name="action" value="unban">
+        <button class="btn small" type="submit">Unban</button>
+        {% else %}
+        <input type="hidden" name="action" value="ban">
+        <button class="btn danger small" type="submit">Ban</button>
+        {% endif %}
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="hint">Showing latest 50 users. Use /users in the bot for the same list.</p>
+{% endblock %}

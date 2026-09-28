@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Dashboard{% endblock %} · Bot Admin</title>
+<link rel="stylesheet" href="/admin/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{ url_for('admin_overview') }}">🎬 Bot Admin</a>
+  <nav class="nav">
+    <a href="{{ url_for('admin_overview') }}">Overview</a>
+    <a href="{{ url_for('admin_files') }}">Files</a>
+    <a href="{{ url_for('admin_users') }}">Users</a>
+    <a href="{{ url_for('admin_broadcast') }}">Broadcast</a>
+    <a href="{{ url_for('admin_requests') }}">Requests</a>
+    <a href="{{ url_for('admin_settings') }}">Settings</a>
+    <a href="{{ url_for('admin_logout') }}" class="logout">Logout</a>
+  </nav>
+</header>
+<main class="container">
+  {% block content %}{% endblock %}
+</main>
+<footer class="footer">Autofilter Bot · admin panel</footer>
+</body>
+</html>

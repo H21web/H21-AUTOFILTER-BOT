@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Files{% endblock %}
+{% block content %}
+<h1>📁 Files <small style="color:var(--mut);font-size:.9rem">({{ total }})</small></h1>
+<form class="toolbar" method="get" action="{{ url_for('admin_files') }}">
+  <input type="text" name="q" placeholder="Search filenames…" value="{{ q }}">
+  <button class="btn" type="submit">Search</button>
+</form>
+<table>
+  <tr><th>ID</th><th>Name</th><th>Quality</th><th>Lang</th><th>Size</th><th></th></tr>
+  {% for f in files %}
+  <tr>
+    <td class="mono">{{ f.id }}</td>
+    <td>{{ f.file_name[:60] }}</td>
+    <td>{{ f.quality or '—' }}</td>
+    <td>{{ f.language or '—' }}</td>
+    <td class="mono">{{ '%.1f'|format((f.file_size or 0)/1048576) }} MB</td>
+    <td>
+      <form class="inline" method="post" action="/admin/files/delete"
+            onsubmit="return confirm('Delete this file from the index?')">
+        <input type="hidden" name="file_id" value="{{ f.id }}">
+        <button class="btn danger small" type="submit">Delete</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<div class="pager">
+  {% if page > 1 %}<a class="btn ghost small" href="{{ url_for('admin_files') }}?q={{ q }}&page={{ page-1 }}">⬅ Prev</a>{% endif %}
+  <span>Page {{ page }} / {{ pages }}</span>
+  {% if page < pages %}<a class="btn ghost small" href="{{ url_for('admin_files') }}?q={{ q }}&page={{ page+1 }}">Next ➡</a>{% endif %}
+</div>
+{% endblock %}

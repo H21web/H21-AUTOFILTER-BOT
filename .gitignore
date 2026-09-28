@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Telegram session strings (secret - never commit)
+*.session
+TG_SESSION*
+
+# Alembic versions cache
+# Local tooling
+.DS_Store

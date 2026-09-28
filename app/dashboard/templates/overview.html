@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<h1>📊 Overview</h1>
+<div class="cards">
+  <div class="card"><div class="k">👥 Users</div><div class="v">{{ users }}</div></div>
+  <div class="card"><div class="k">📁 Files indexed</div><div class="v">{{ files }}</div></div>
+  <div class="card"><div class="k">👥 Groups</div><div class="v">{{ groups }}</div></div>
+  <div class="card"><div class="k">🔍 Searches today</div><div class="v">{{ searches_today }}</div></div>
+  <div class="card"><div class="k">🔍 Searches / 7d</div><div class="v">{{ searches_week }}</div></div>
+  <div class="card"><div class="k">📩 Pending requests</div><div class="v">{{ pending }}</div></div>
+  <div class="card"><div class="k">💾 Indexed size</div><div class="v">{{ '%.1f'|format(storage/1073741824) }}<small> GB</small></div></div>
+</div>
+
+<h2>🔥 Top searches (7 days)</h2>
+{% if top %}
+<table>
+  <tr><th>Query</th><th>Searches</th></tr>
+  {% for q, c in top %}
+  <tr><td>{{ q }}</td><td>{{ c }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">No searches with results in the last 7 days.</p>
+{% endif %}
+{% endblock %}

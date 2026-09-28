@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>⚙️ Settings</h1>
+<form method="post" action="{{ url_for('admin_settings') }}">
+  <div class="toggle">
+    <input type="checkbox" name="force_sub" value="on" {% if force_sub %}checked{% endif %}>
+    <span>🔐 Force-subscribe (users must join channels before downloads)</span>
+  </div>
+  <div class="toggle">
+    <input type="checkbox" name="stream" value="on" {% if stream %}checked{% endif %}>
+    <span>▶️ Stream player (watch/download links — uses server bandwidth)</span>
+  </div>
+  <label>Force-sub channels (comma-separated @usernames or ids)</label>
+  <input type="text" name="channels" value="{{ channels }}" placeholder="@mychannel, -1001234567890">
+  <label>Main channel id for new-movie alerts (empty = disabled)</label>
+  <input type="text" name="main_channel" value="{{ main_channel }}" placeholder="-1001234567890">
+  <button class="btn" type="submit">💾 Save</button>
+</form>
+<p class="hint">Unset values fall back to the server's environment variables.</p>
+{% endblock %}

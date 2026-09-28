@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Broadcast{% endblock %}
+{% block content %}
+<h1>📢 Broadcast</h1>
+{% if error %}<div class="alert">{{ error }}</div>{% endif %}
+<div class="card" style="margin-bottom:16px">
+  <div class="k">Last broadcast</div>
+  <div><span class="badge {% if last.status=='running' %}warn{% elif last.status=='done' %}ok{% elif last.status=='idle' %}ok{% else %}bad{% endif %}">{{ last.status }}</span>
+  {% if last.total %} — ✅ {{ last.ok }} delivered, ❌ {{ last.fail }} failed, of {{ last.total }}{% endif %}</div>
+</div>
+<form method="post" action="{{ url_for('admin_broadcast') }}">
+  <label>Message (HTML allowed: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;)</label>
+  <textarea name="message" placeholder="Hello everyone! 🎬&#10;&#10;New movies added…"></textarea>
+  <button class="btn" type="submit">🚀 Send to all users</button>
+</form>
+<p class="hint">Banned users are skipped. Sending is throttled to avoid Telegram rate limits.</p>
+{% endblock %}
