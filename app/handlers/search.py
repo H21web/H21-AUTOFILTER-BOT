@@ -190,29 +190,14 @@ async def deliver_file(bot, chat_id: int, user_id: int, file_db_id: int,
         ])
 
     try:
-        # Bot mode: send via Pyrogram (same MTProto session that indexed).
-        # Bot API rejects MTProto file_ids ("can't unserialize it"), but
-        # Pyrogram accepts them because it's the same session.
-        if settings.INDEXER_BOT_MODE:
-            from app.services.mtproto_index import get_pyro_client
-            from pyrogram import enums
-            pyro = await get_pyro_client()
-            await pyro.send_document(
-                chat_id=chat_id,
-                document=row["file_id"],
-                caption=caption,
-                parse_mode=enums.ParseMode.HTML,
-                reply_to_message_id=reply_to,
-            )
-        else:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=row["file_id"],
-                caption=caption,
-                parse_mode="HTML",
-                reply_markup=kb,
-                reply_to_message_id=reply_to,
-            )
+        await bot.send_document(
+            chat_id=chat_id,
+            document=row["file_id"],
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=kb,
+            reply_to_message_id=reply_to,
+        )
     except Forbidden:
         log.info("forbidden sending to %s", chat_id)
     except BadRequest as exc:
