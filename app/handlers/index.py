@@ -1,16 +1,17 @@
-"""Channel auto-indexing + manual admin indexing + new-movie alerts.
+"""Channel auto-indexing (old MoovidexFilterBot logic) + manual indexing.
 
-- Every document/video/audio posted in a channel the bot can read is indexed
-  automatically (file_id, name, size, caption, quality/language detection).
-- Admins can also index manually: forward any files/channel posts to the bot
-  in PM (single or multi-select bulk forward) or upload directly — each is
-  indexed with a live progress counter.
-- /index (admin) opens the control panel: queue channels, set skip /
-  message-range / max-files options, then launch a backfill with live
-  progress, or index manually.
+Auto-index working:
+- Detects documents/videos/audio posted in the INDEX_CHANNELS list only.
+- Validates the file has a usable filename before processing.
+- Copies the message caption and saves it with the file details.
+- save_file() writes to the DB: explicit duplicate check first, skips
+  duplicates without saving again.
+- DB save errors are reported to LOG_CHANNEL; unexpected errors are caught
+  so the bot never crashes on a bad post.
+- Debug details go to the console (processing / duplicates / errors).
 
-When the first file of a *new* title lands, an alert card goes out to
-MAIN_CHANNEL_ID with the TMDB poster and a deep-link button back to the bot.
+Manual admin indexing (unchanged): forward files to the bot in PM.
+New-movie alerts still go to MAIN_CHANNEL_ID.
 """
 from __future__ import annotations
 
@@ -47,16 +48,21 @@ from app.services import tmdb
 log = logging.getLogger(__name__)
 
 
-def _file_name_for(msg, doc) -> str:
+def _valid_file_name(msg, doc) -> str:
+    """Return a usable filename, or "" when there is none.
+
+    Prefers the Telegram file_name; PTB Video/Audio objects carry no
+    file_name, so the caption's first line is the fallback (same as before).
+    Empty/blank -> the file is skipped, never indexed.
+    """
     name = getattr(doc, "file_name", None)
-    if name:
-        return name
+    if name and str(name).strip():
+        return str(name).strip()[:500]
     if msg.caption:
-        first = msg.caption.strip().split("\n")[0][:80]
+        first = msg.caption.strip().split("\n")[0].strip()[:500]
         if first:
             return first
-    kind = "video" if msg.video else "audio" if msg.audio else "file"
-    return f"{kind}_{msg.message_id}"
+    return ""
 
 
 async def _is_new_title(session, tk: str, file_id: str) -> bool:
@@ -66,23 +72,54 @@ async def _is_new_title(session, tk: str, file_id: str) -> bool:
     return (await session.execute(stmt)).scalar() == 0
 
 
-async def _store_file(msg, doc) -> tuple[bool, str, bool]:
-    """Insert one file row (deduped by file_id).
+async def _alert_log_channel(bot, text: str) -> None:
+    """Report an auto-index failure to LOG_CHANNEL (if configured)."""
+    channel_id = settings.log_channel_id
+    if not channel_id or bot is None:
+        return
+    try:
+        await bot.send_message(channel_id, text, parse_mode="HTML")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not alert LOG_CHANNEL: %s", exc)
 
-    Returns (inserted, file_name, is_new_title).
+
+async def save_file(msg, doc, bot=None) -> tuple[str, str, bool]:
+    """Old-bot style save: validate -> duplicate check -> insert.
+
+    Returns (status, file_name, is_new_title); status is one of:
+        "saved"     - new row inserted
+        "duplicate" - file_id already in DB, skipped without saving
+        "no_name"   - no valid filename, skipped
+        "error"     - DB error (alert sent to LOG_CHANNEL)
+    Always returns 3 values, even on failure.
     """
+    file_name = _valid_file_name(msg, doc)
+    if not file_name:
+        log.debug("auto-index skip: no valid filename (chat %s msg %s)",
+                  msg.chat_id, msg.message_id)
+        return "no_name", "", False
+
     file_id = doc.file_id
-    file_name = _file_name_for(msg, doc)
-    caption = (msg.caption or "")[:1000]
-    quality, language = detect_quality_language(f"{file_name} {caption}")
-    tk = title_key(file_name)
+    log.debug("auto-index processing %r (chat %s msg %s)",
+              file_name, msg.chat_id, msg.message_id)
 
     factory = get_session_factory(settings.DATABASE_URL)
     try:
         async with factory() as session:
+            # explicit duplicate check first (old-bot logic)
+            exists = (await session.execute(
+                select(File.id).where(File.file_id == file_id).limit(1)
+            )).first()
+            if exists:
+                log.debug("auto-index skip duplicate %r", file_name)
+                return "duplicate", file_name, False
+
+            caption = (msg.caption or "")[:1000]
+            quality, language = detect_quality_language(f"{file_name} {caption}")
+            tk = title_key(file_name)
             stmt = pg_insert(File).values(
                 file_id=file_id,
-                file_name=file_name[:500],
+                file_name=file_name,
                 file_size=getattr(doc, "file_size", None),
                 mime_type=getattr(doc, "mime_type", None),
                 caption=caption or None,
@@ -94,12 +131,22 @@ async def _store_file(msg, doc) -> tuple[bool, str, bool]:
             ).on_conflict_do_nothing(index_elements=["file_id"])
             result = await session.execute(stmt)
             await session.commit()
-            inserted = (result.rowcount or 0) > 0
-            new_title = inserted and tk and await _is_new_title(session, tk, file_id)
+            if not (result.rowcount or 0):
+                # lost a race with a concurrent insert -> treat as duplicate
+                log.debug("auto-index skip duplicate (race) %r", file_name)
+                return "duplicate", file_name, False
+            log.debug("auto-index saved %r", file_name)
+            new_title = bool(tk) and await _is_new_title(session, tk, file_id)
+            return "saved", file_name, bool(new_title)
     except Exception as exc:  # noqa: BLE001
-        log.warning("indexing failed: %s", exc)
-        return False, file_name
-    return inserted, file_name, bool(new_title)
+        log.warning("auto-index DB error for %r: %s", file_name, exc)
+        await _alert_log_channel(
+            bot,
+            "🗄️ <b>Auto-index DB error</b>\n"
+            f"📄 {_html.escape(file_name)}\n"
+            f"🆔 <code>{msg.chat_id}</code> / msg {msg.message_id}\n"
+            f"❌ <code>{_html.escape(str(exc))}</code>")
+        return "error", file_name, False
 
 
 async def _post_new_movie_alert(bot, file_name: str) -> None:
@@ -145,17 +192,36 @@ async def _post_new_movie_alert(bot, file_name: str) -> None:
 
 async def on_channel_post(update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.channel_post
-    if not msg:
-        return
-    doc = msg.document or msg.video or msg.audio
-    if doc is None:
-        return
+    """Auto-index new channel posts — old MoovidexFilterBot logic.
 
-    inserted, file_name, new_title = await _store_file(msg, doc)
-    if new_title:
-        await _post_new_movie_alert(context.bot, file_name)
-    log.debug("indexed %r (new=%s)", file_name, bool(new_title))
+    Only channels in INDEX_CHANNELS are processed. The whole handler is
+    wrapped so one bad post can never crash the bot.
+    """
+    try:
+        msg = update.channel_post
+        if not msg:
+            return
+        if msg.chat_id not in settings.index_channels:
+            log.debug("auto-index ignore post from unlisted channel %s",
+                      msg.chat_id)
+            return
+        doc = msg.document or msg.video or msg.audio
+        if doc is None:
+            return
+        status, file_name, new_title = await save_file(msg, doc,
+                                                       bot=context.bot)
+        log.debug("auto-index result: %s %r", status, file_name)
+        if status == "saved" and new_title:
+            await _post_new_movie_alert(context.bot, file_name)
+    except Exception as exc:  # noqa: BLE001 - never let a post kill the bot
+        log.exception("auto-index unexpected error (caught): %s", exc)
+        try:
+            await _alert_log_channel(
+                context.bot,
+                "⚠️ <b>Auto-index unexpected error</b>\n"
+                f"❌ <code>{_html.escape(str(exc))}</code>")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ------------------------------------------------- manual admin indexing ---
@@ -196,8 +262,9 @@ async def on_admin_pm_media(update: Update,
     if doc is None:
         return
 
-    inserted, file_name, new_title = await _store_file(msg, doc)
-    if new_title:
+    status, file_name, new_title = await save_file(msg, doc,
+                                                     bot=context.bot)
+    if status == "saved" and new_title:
         await _post_new_movie_alert(context.bot, file_name)
 
     data = context.chat_data
@@ -298,8 +365,8 @@ async def _panel_data(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
             "⚠️ not configured — set TG_SESSION on the server")
     text = (
         "📥 <b>Index control panel</b>\n\n"
-        "1️⃣ <b>Auto</b> — new files posted in any channel the bot can read "
-        "are indexed automatically.\n"
+        "1️⃣ <b>Auto</b> — new files posted in INDEX_CHANNELS are indexed "
+        "automatically (set the env var; empty = channel auto-index off).\n"
         "2️⃣ <b>Manual</b> — forward files/channel posts to me here in PM "
         "(multi-select up to 100 at once), or upload files directly.\n"
         f"3️⃣ <b>Backfill</b> — {auto}.\n\n"

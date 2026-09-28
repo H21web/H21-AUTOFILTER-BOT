@@ -42,6 +42,11 @@ async def lifespan(app: FastAPI):
     await ptb_app.start()
     app.state.ptb_app = ptb_app
     log.info("PTB application started; webhook receiver ready.")
+    watched = settings.index_channels
+    if watched:
+        log.info("auto-index watching %d channel(s): %s", len(watched), watched)
+    else:
+        log.warning("INDEX_CHANNELS is empty — channel auto-index is disabled.")
     yield
     await ptb_app.stop()
     await ptb_app.shutdown()

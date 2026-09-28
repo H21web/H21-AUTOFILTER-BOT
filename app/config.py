@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     server-side auto-index feature is disabled. Generate it locally with
     make-session.py and paste the value into the host's env vars."""
 
+    INDEX_CHANNELS: str = ""
+    """Comma-separated channel ids whose new posts are auto-indexed,
+    e.g. "-1001234567890,-1009876543210" (old MoovidexFilterBot CHANNELS
+    list logic). Empty = channel auto-index disabled."""
+
+    LOG_CHANNEL: str = ""
+    """Channel id where database save errors and unexpected auto-index
+    failures are reported. Empty = alerts disabled (console log only)."""
+
     FORCE_SUB_CHANNELS: str = ""
     """Comma-separated channel ids/usernames users must join, e.g. "@chan,-100123"."""
 
@@ -118,6 +127,19 @@ class Settings(BaseSettings):
         """MAIN_CHANNEL_ID parsed to int, or None when unset/invalid."""
         try:
             return int(self.MAIN_CHANNEL_ID.strip())
+        except (ValueError, AttributeError):
+            return None
+
+    @property
+    def index_channels(self) -> list[int]:
+        """INDEX_CHANNELS parsed to a list of chat ids."""
+        return _parse_int_csv(self.INDEX_CHANNELS)
+
+    @property
+    def log_channel_id(self) -> int | None:
+        """LOG_CHANNEL parsed to int, or None when unset/invalid."""
+        try:
+            return int(self.LOG_CHANNEL.strip())
         except (ValueError, AttributeError):
             return None
 
