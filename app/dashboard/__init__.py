@@ -15,7 +15,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import and_, delete, func, or_, select
 
 from app.config import settings
 from app.db import get_session_factory
@@ -164,6 +164,102 @@ async def files_delete(request: Request, _=Depends(require_login),
         if row:
             await session.delete(row)
             await session.commit()
+    return RedirectResponse(url="/admin/files", status_code=303)
+
+
+# ------------------------------------------------- bulk file deletion ---
+
+def _bulk_delete_where(action: str, keyword: str = "",
+                       date_from: str = "", date_to: str = ""):
+    """WHERE clause for a bulk file delete.
+
+    Actions: "keyword" (file_name/caption ILIKE), "date" (created_at range,
+    YYYY-MM-DD), "all". Returns ``True`` for "all" (no filter), ``None``
+    when the inputs are invalid.
+    """
+    if action == "keyword":
+        kw = keyword.strip()
+        if not kw:
+            return None
+        like = f"%{kw}%"
+        return or_(File.file_name.ilike(like), File.caption.ilike(like))
+    if action == "date":
+        conds = []
+        try:
+            if date_from:
+                start = datetime.fromisoformat(date_from).replace(
+                    tzinfo=timezone.utc)
+                conds.append(File.created_at >= start)
+            if date_to:
+                end = (datetime.fromisoformat(date_to)
+                       + timedelta(days=1)).replace(tzinfo=timezone.utc)
+                conds.append(File.created_at < end)
+        except ValueError:
+            return None
+        return and_(*conds) if conds else None
+    if action == "all":
+        return True
+    return None
+
+
+def _bulk_delete_label(action: str, keyword: str = "",
+                       date_from: str = "", date_to: str = "") -> str:
+    if action == "keyword":
+        return f'files matching keyword "{keyword.strip()}"'
+    if action == "date":
+        return (f"files indexed from {date_from or 'the beginning'} "
+                f"to {date_to or 'now'}")
+    return "ALL indexed files"
+
+
+@router.post("/files/bulk-preview", response_class=HTMLResponse)
+async def files_bulk_preview(request: Request, _=Depends(require_login),
+                             action: str = Form(...), keyword: str = Form(""),
+                             date_from: str = Form(""),
+                             date_to: str = Form("")):
+    """Show how many files a bulk delete would remove (confirm step)."""
+    if isinstance(_, RedirectResponse):
+        return _
+    where = _bulk_delete_where(action, keyword, date_from, date_to)
+    if where is None:
+        return RedirectResponse(url="/admin/files", status_code=303)
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as session:
+        count_stmt = select(func.count()).select_from(File)
+        if where is not True:
+            count_stmt = count_stmt.where(where)
+        count = (await session.execute(count_stmt)).scalar() or 0
+    return _render(request, "files_confirm.html", action=action,
+                   keyword=keyword, date_from=date_from, date_to=date_to,
+                   count=count,
+                   label=_bulk_delete_label(action, keyword,
+                                            date_from, date_to))
+
+
+@router.post("/files/bulk-delete")
+async def files_bulk_delete(request: Request, _=Depends(require_login),
+                            action: str = Form(...), keyword: str = Form(""),
+                            date_from: str = Form(""),
+                            date_to: str = Form(""),
+                            confirm: str = Form("")):
+    """Execute the bulk delete (removes rows from the database)."""
+    if isinstance(_, RedirectResponse):
+        return _
+    # "Delete all" needs the typed confirmation to match.
+    if action == "all" and confirm.strip().upper() != "DELETE ALL":
+        return RedirectResponse(url="/admin/files", status_code=303)
+    where = _bulk_delete_where(action, keyword, date_from, date_to)
+    if where is None:
+        return RedirectResponse(url="/admin/files", status_code=303)
+    factory = get_session_factory(settings.DATABASE_URL)
+    async with factory() as session:
+        stmt = delete(File)
+        if where is not True:
+            stmt = stmt.where(where)
+        result = await session.execute(stmt)
+        await session.commit()
+        log.warning("bulk file delete: action=%s deleted=%s rows",
+                    action, result.rowcount)
     return RedirectResponse(url="/admin/files", status_code=303)
 
 

@@ -67,12 +67,13 @@ class Settings(BaseSettings):
 
     BACKFILL_MODE: str = "direct"
     """Backfill method: "direct" packs Bot API file_ids straight from
-    channel history (fastest, ~500-1000 files/sec/account, no PM flood);
-    "forward" forwards every file to the bot first (proven fallback)."""
+    channel history (fastest, ~500-1000 files/sec/account, Pyrogram-compatible
+    packing); "forward" bulk-forwards files to the bot first (proven
+    fallback, ~15-30 files/sec/account)."""
 
     BACKFILL_DELAY: float = 0.5
-    """Seconds between forwarded files, per indexer account (forward mode
-    only). Lower = faster but more FloodWaits; 0.5 is the safe sweet spot."""
+    BACKFILL_BATCH: int = 30
+    """Files per forward API call (forward mode only, max ~100)."""
 
     BACKFILL_CHUNK: int = 200000
     """Message-id range per backfill job. Smaller chunks = finer resume

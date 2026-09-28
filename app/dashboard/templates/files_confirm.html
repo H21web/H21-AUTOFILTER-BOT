@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Confirm bulk delete{% endblock %}
+{% block content %}
+<h1>⚠️ Confirm bulk delete</h1>
+<p>You are about to permanently delete <strong>{{ count }}</strong> {{ label }} from the database.</p>
+<p style="color:var(--mut)">This cannot be undone.</p>
+<form method="post" action="/admin/files/bulk-delete">
+  <input type="hidden" name="action" value="{{ action }}">
+  <input type="hidden" name="keyword" value="{{ keyword }}">
+  <input type="hidden" name="date_from" value="{{ date_from }}">
+  <input type="hidden" name="date_to" value="{{ date_to }}">
+  {% if action == "all" %}
+  <p><label>Type <code>DELETE ALL</code> below to confirm:</label></p>
+  <p><input type="text" name="confirm" placeholder="DELETE ALL" required autocomplete="off"></p>
+  {% endif %}
+  <p>
+    <button class="btn danger" type="submit">Yes, delete {{ count }} file{{ 's' if count != 1 }}</button>
+    <a class="btn ghost" href="{{ url_for('admin_files') }}">Cancel</a>
+  </p>
+</form>
+{% endblock %}

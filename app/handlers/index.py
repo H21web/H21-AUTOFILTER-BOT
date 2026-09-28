@@ -886,7 +886,8 @@ def _agg_text(agg: dict, started: float = 0.0,
         pct = min(1.0, agg["saved"] / cfg["limit"])
         lines.append(f"{_bar(pct)} <b>{pct * 100:.0f}%</b>")
         lines.append("")
-    lines.append(f"💾 Saved: <b>{agg['saved']}</b>")
+    saved_label = "📨 Forwarded" if agg.get("mode") == "forward" else "💾 Saved"
+    lines.append(f"{saved_label}: <b>{agg['saved']}</b>")
     lines.append(f"⏭️ Skipped: <b>{agg['skipped']}</b>")
     if agg.get("dupes"):
         lines.append(f"♻️ Already indexed: <b>{agg['dupes']}</b>")
@@ -999,7 +1000,8 @@ async def _begin_backfill(context: ContextTypes.DEFAULT_TYPE, token: str,
         else:
             tail = "✅ <b>Done.</b>"
         final = (f"📥 <b>Backfill finished</b> ({totals.get('mode', '?')} mode)\n\n"
-                 f"💾 Saved: <b>{totals.get('saved', 0)}</b>\n"
+                 f"{'📨 Forwarded' if totals.get('mode') == 'forward' else '💾 Saved'}: "
+                 f"<b>{totals.get('saved', 0)}</b>\n"
                  f"⏭️ Skipped: <b>{totals.get('skipped', 0)}</b>\n"
                  f"♻️ Already indexed: <b>{totals.get('dupes', 0)}</b>\n"
                  f"❌ Errors: <b>{totals.get('errors', 0)}</b>\n"

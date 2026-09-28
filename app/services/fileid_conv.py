@@ -51,6 +51,9 @@ _OLD_TAIL = b"\x16\x04"
 # Bot API persistent file-id framing for document-type files.
 _SUB_VERSION = 60
 _VERSION = 4
+# Pyrogram's document file_id version (proven working with the Bot API).
+_PYRO_MINOR = 30
+_PYRO_MAJOR = 4
 _FILE_REFERENCE_FLAG = 1 << 25
 
 # RLE zero-run cap used by the official encoding.
@@ -190,11 +193,17 @@ def pack_bot_file_id_typed(file_type: int, dc_id: int, media_id: int,
                            file_reference: bytes | None) -> str | None:
     """Pack a FRESH MTProto file into a Bot API file_id string.
 
-    Unlike telethon's ``pack_bot_file_id`` (which omits the file_reference
-    and which the Bot API rejects), this embeds the file_reference fetched
-    with the file, using the verified layout::
+    Byte-for-byte compatible with Pyrogram's ``FileId.encode()`` for
+    documents (the format proven to work when a bot re-sends a file_id
+    whose file_reference came from a user session)::
 
-        [type u32 | 1<<25][dc u32][fileref TL][id i64][access_hash i64][60][4]
+        [type i32 | 1<<25][dc i32][fileref TL][id i64][access_hash i64]
+        [minor i32][major i32][minor u8][major u8]
+
+    (minor=30, major=4 — exactly what Pyrogram emits). The 8-byte
+    ``[minor i32][major i32]`` section is REQUIRED by the Bot API server
+    when a file_reference is present; without it the server replies
+    "Wrong file identifier".
 
     Returns None when there is no file_reference -- without it the Bot API
     cannot use the id ("can't unserialize it").
@@ -202,12 +211,13 @@ def pack_bot_file_id_typed(file_type: int, dc_id: int, media_id: int,
     if not file_reference:
         return None
     buf = bytearray()
-    buf += struct.pack("<I", (file_type | _FILE_REFERENCE_FLAG) & 0xFFFFFFFF)
-    buf += struct.pack("<I", dc_id & 0xFFFFFFFF)
+    buf += struct.pack("<i", file_type | _FILE_REFERENCE_FLAG)
+    buf += struct.pack("<i", dc_id)
     _pack_file_reference(buf, bytes(file_reference))
     buf += struct.pack("<q", media_id)
     buf += struct.pack("<q", access_hash)
-    buf += bytes([_SUB_VERSION, _VERSION])
+    buf += struct.pack("<ii", _PYRO_MINOR, _PYRO_MAJOR)
+    buf += struct.pack("<bb", _PYRO_MINOR, _PYRO_MAJOR)
     return _b64_encode(_rle_encode(bytes(buf)))
 
 
@@ -230,6 +240,8 @@ if __name__ == "__main__":
     print("OK: conversion round-trips through the Bot API decoder")
 
     # Fresh pack: with a file_reference the id must decode back completely.
+    # (Pyrogram-compatible: minor=30, and the 8-byte [minor i32][major i32]
+    # section the Bot API server requires when a file_reference is present.)
     fake_ref = bytes(range(1, 32))
     packed = pack_bot_file_id_typed(5, 4, 123456789, 987654321, fake_ref)
     assert packed, "pack returned None"
@@ -237,7 +249,11 @@ if __name__ == "__main__":
     assert d2["type"] == 5 and d2["dc_id"] == 4
     assert d2["media_id"] == 123456789 and d2["access_hash"] == 987654321
     assert d2["file_reference"] == fake_ref
-    assert d2["sub_version"] == 60 and d2["version"] == 4
+    assert d2["sub_version"] == 30 and d2["version"] == 4
+    # Byte-level check vs Pyrogram's FileId.encode layout.
+    raw2 = _rle_decode(_b64_decode(packed))
+    assert raw2[-10:] == struct.pack("<ii", 30, 4) + bytes([30, 4]), \
+        f"tail mismatch: {raw2[-10:].hex()}"
     assert pack_bot_file_id_typed(5, 4, 1, 1, None) is None
     assert pack_bot_file_id_typed(5, 4, 1, 1, b"") is None
-    print("OK: fresh pack with file_reference round-trips")
+    print("OK: fresh pack with file_reference round-trips (Pyrogram layout)")

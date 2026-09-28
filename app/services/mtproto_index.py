@@ -2,19 +2,19 @@
 
 Two modes (BACKFILL_MODE):
 
-- **direct** (default, fastest): walk history with iter_messages, pack each
-  media file into a Bot API file_id using the *verified* Bot API layout
-  (``[type|1<<25][dc][file_reference][id][access_hash][60][4]`` — the fresh
-  file_reference comes from getHistory itself), and bulk-insert rows into
-  Postgres. No per-file forward, no PM flood, no bot-side processing:
-  ~500-1000 files/sec per account, so 1M files in ~20-40 min/account.
-  NOTE: packed ids need one live test (index a small channel, fetch a file
-  via /search) to confirm the Bot API accepts user-session file_references;
-  if it ever rejects them, flip BACKFILL_MODE=forward.
+- **forward** (proven fallback): forward every media message to the bot in
+  bulk batches (BACKFILL_BATCH per API call), which indexes each received
+  file with a Bot-API-issued file_id: ~15-30 files/sec per account.
+  The file_ids are guaranteed Bot-API-issued, so delivery always works.
 
-- **forward** (proven fallback): forward every media message to the bot,
-  which indexes each received file (~2 files/sec/account). Slower but
-  the file_ids are guaranteed Bot-API-issued.
+- **direct** (default, fastest): walk history with iter_messages, pack each
+  media file into a Bot API file_id and bulk-insert rows into Postgres
+  (~500-1000 files/sec/account). The packer is byte-for-byte identical to
+  Pyrogram's ``FileId.encode()`` (the format Tech VJ-style bots rely on):
+  ``[type|1<<25][dc][file_reference][id][access_hash][minor i32][major i32]
+  [minor u8][major u8]``. NOTE: the 8-byte ``[minor i32][major i32]`` section
+  is REQUIRED when a file_reference is present — omitting it makes the Bot
+  API reply "Wrong file identifier" (hit 2026-09-28, fixed same day).
 
 Shared safety: chunked resumable jobs (backfill_jobs table, SKIP LOCKED
 claiming, offset_id checkpointed as the worker walks), FloodWait backoff
@@ -470,7 +470,9 @@ async def _walk_job_forward(client, factory, job: dict, ctx: dict) -> dict:
     """Walk one job newest->oldest, forwarding media to the bot.
 
     Proven fallback (BACKFILL_MODE=forward): every file arrives at the bot
-    as a PM and is indexed with a Bot-API-issued file_id. ~2 files/sec.
+    as a PM and is indexed with a Bot-API-issued file_id. Forwards go out
+    in bulk batches (BACKFILL_BATCH per API call) — roughly 15-30 files/sec
+    per worker, with FloodWait backoff for safety.
     """
     from telethon.errors import FloodWaitError
 
@@ -535,6 +537,9 @@ async def _walk_job_forward(client, factory, job: dict, ctx: dict) -> dict:
 
         done_ids = await _already_indexed(factory, src_id,
                                           [i for i, _ in cands])
+        # Filter to fresh messages, honoring skip/limit, then bulk-forward
+        # in batches: one API call per batch instead of one per file.
+        fresh = []
         for mid, m in cands:
             if ctx["cancel"].is_set() or ctx.get("limit_hit"):
                 break
@@ -554,13 +559,20 @@ async def _walk_job_forward(client, factory, job: dict, ctx: dict) -> dict:
                         ctx["limit_hit"] = True
                         break
                     ctx["remaining"] -= 1
+            fresh.append(mid)
+        batch_size = max(1, int(ctx.get("batch_size", 30)))
+        for i in range(0, len(fresh), batch_size):
+            if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+                break
+            chunk = fresh[i:i + batch_size]
             try:
-                await client.forward_messages(bot_peer, m)
-                stats["saved"] += 1
+                await client.forward_messages(bot_peer, chunk,
+                                              from_peer=channel)
+                stats["saved"] += len(chunk)
                 fw_streak = 0
-                since_checkpoint += 1
-                offset_id = mid
-                await asyncio.sleep(delay + random.uniform(0, 0.25))
+                since_checkpoint += len(chunk)
+                offset_id = chunk[-1]  # newest->oldest: last = oldest id
+                await asyncio.sleep(delay + random.uniform(0, 0.5))
             except FloodWaitError as e:
                 fw_streak += 1
                 wait = e.seconds + 5
@@ -578,7 +590,8 @@ async def _walk_job_forward(client, factory, job: dict, ctx: dict) -> dict:
                 break
             except Exception as e:  # noqa: BLE001
                 stats["errors"] += 1
-                log.warning("backfill forward failed msg %s: %s", mid, e)
+                log.warning("backfill forward failed chunk %s..%s: %s",
+                            chunk[0], chunk[-1], e)
             if since_checkpoint >= _CHECKPOINT_EVERY:
                 since_checkpoint = 0
                 await checkpoint()
@@ -641,7 +654,9 @@ async def run_backfill(run_token: str, bot_username: str,
     ctx = {
         "cancel": cancel_event,
         "lock": asyncio.Lock(),
-        "delay": max(0.2, float(settings.BACKFILL_DELAY)),
+        # inter-batch delay for forward mode (bulk); direct mode ignores it
+        "delay": max(1.0, float(settings.BACKFILL_DELAY)),
+        "batch_size": max(1, int(settings.BACKFILL_BATCH)),
         "bot_username": bot_username,
         "remaining": limit or None,
         "mode": mode,
@@ -695,7 +710,7 @@ async def backfill_stats(run_token: str) -> dict:
     agg = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0,
            "errors": 0, "pending": 0, "running": 0, "done": 0,
            "cancelled": 0, "error": 0, "total": 0, "titles": [],
-           "last_error": ""}
+           "last_error": "", "mode": backfill_mode()}
     async with factory() as session:
         rows = (await session.execute(
             select(BackfillJob.status, BackfillJob.stats,

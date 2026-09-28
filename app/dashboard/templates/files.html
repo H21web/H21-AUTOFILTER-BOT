@@ -30,4 +30,29 @@
   <span>Page {{ page }} / {{ pages }}</span>
   {% if page < pages %}<a class="btn ghost small" href="{{ url_for('admin_files') }}?q={{ q }}&page={{ page+1 }}">Next ➡</a>{% endif %}
 </div>
+
+<h2 style="margin-top:2rem">🧹 Bulk delete</h2>
+<p style="color:var(--mut)">Delete many files at once. A preview shows exactly how many files match before anything is deleted from the database.</p>
+
+<form method="post" action="/admin/files/bulk-preview" style="margin-bottom:1rem">
+  <input type="hidden" name="action" value="keyword">
+  <label>Keyword <small style="color:var(--mut)">(matches filename or caption)</small></label><br>
+  <input type="text" name="keyword" placeholder="e.g. Avengers" required>
+  <button class="btn danger small" type="submit">Preview delete by keyword</button>
+</form>
+
+<form method="post" action="/admin/files/bulk-preview" style="margin-bottom:1rem">
+  <input type="hidden" name="action" value="date">
+  <label>Indexed from</label>
+  <input type="date" name="date_from">
+  <label>to</label>
+  <input type="date" name="date_to">
+  <button class="btn danger small" type="submit">Preview delete by date</button>
+</form>
+
+<form method="post" action="/admin/files/bulk-preview"
+      onsubmit="return confirm('Preview deleting ALL indexed files? This cannot be undone.')">
+  <input type="hidden" name="action" value="all">
+  <button class="btn danger small" type="submit">Preview delete ALL files</button>
+</form>
 {% endblock %}
