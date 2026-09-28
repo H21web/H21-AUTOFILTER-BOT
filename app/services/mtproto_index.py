@@ -6,15 +6,18 @@ Two modes (BACKFILL_MODE):
   bulk batches (BACKFILL_BATCH per API call), which indexes each received
   file with a Bot-API-issued file_id: ~15-30 files/sec per account.
   The file_ids are guaranteed Bot-API-issued, so delivery always works.
+  Use this with user sessions (TG_SESSIONS) when the bot can't join the
+  channel directly.
 
 - **direct** (default, fastest): walk history with iter_messages, pack each
   media file into a Bot API file_id and bulk-insert rows into Postgres
-  (~500-1000 files/sec/account). The packer is byte-for-byte identical to
-  Pyrogram's ``FileId.encode()`` (the format Tech VJ-style bots rely on):
-  ``[type|1<<25][dc][file_reference][id][access_hash][minor i32][major i32]
-  [minor u8][major u8]``. NOTE: the 8-byte ``[minor i32][major i32]`` section
-  is REQUIRED when a file_reference is present — omitting it makes the Bot
-  API reply "Wrong file identifier" (hit 2026-09-28, fixed same day).
+  (~500-1000 files/sec, Pyrogram-compatible packing). REQUIRES
+  INDEXER_BOT_MODE=true — the indexer logs in as the bot itself via
+  MTProto, so the file_references come from the bot's own session and the
+  Bot API accepts them (same account). This is exactly how Tech VJ-style
+  bots do it: bot token only, no user session string. NOTE: user sessions
+  (TG_SESSIONS) do NOT work for direct mode — a user session's
+  file_reference is rejected by the Bot API ("can't unserialize it").
 
 Shared safety: chunked resumable jobs (backfill_jobs table, SKIP LOCKED
 claiming, offset_id checkpointed as the worker walks), FloodWait backoff
@@ -47,6 +50,9 @@ _DIRECT_BATCH = 500
 
 def indexer_configured() -> bool:
     from app.config import settings
+    if settings.INDEXER_BOT_MODE:
+        return bool(settings.BOT_TOKEN and settings.TG_API_ID
+                    and settings.TG_API_HASH)
     return bool(settings.tg_sessions and settings.TG_API_ID
                 and settings.TG_API_HASH)
 
@@ -94,24 +100,38 @@ def _entity_ref(ref: str):
 
 
 async def get_clients() -> list:
-    """Lazily build one Telethon client per configured session."""
+    """Lazily build indexer clients.
+
+    Bot mode (INDEXER_BOT_MODE): logs in as the bot itself via MTProto —
+    no user session needed. User mode: one Telethon client per configured
+    session string.
+    """
     global _clients
     if not indexer_configured():
         raise RuntimeError(
-            "indexer not configured (set TG_SESSION/TG_SESSIONS + "
-            "TG_API_ID/TG_API_HASH)")
+            "indexer not configured (set INDEXER_BOT_MODE=true or "
+            "TG_SESSION/TG_SESSIONS + TG_API_ID/TG_API_HASH)")
     if not _clients:
         async with _clients_lock:
             if not _clients:
                 from telethon import TelegramClient
                 from telethon.sessions import StringSession
                 from app.config import settings
-                for sess in settings.tg_sessions:
-                    _clients.append(TelegramClient(
-                        StringSession(sess),
+                if settings.INDEXER_BOT_MODE:
+                    c = TelegramClient(
+                        StringSession(),
                         int(settings.TG_API_ID),
                         settings.TG_API_HASH,
-                    ))
+                    )
+                    await c.start(bot_token=settings.BOT_TOKEN)
+                    _clients.append(c)
+                else:
+                    for sess in settings.tg_sessions:
+                        _clients.append(TelegramClient(
+                            StringSession(sess),
+                            int(settings.TG_API_ID),
+                            settings.TG_API_HASH,
+                        ))
     for c in _clients:
         if not c.is_connected():
             await c.connect()

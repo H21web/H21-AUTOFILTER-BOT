@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     one parallel backfill worker (needs its own spare Telegram account).
     Falls back to TG_SESSION when empty."""
 
+    INDEXER_BOT_MODE: bool = False
+    """When True, the indexer logs in as the bot itself via MTProto
+    (BOT_TOKEN + TG_API_ID/TG_API_HASH) — NO user session string needed.
+    The bot must be a member of the channel to read its history.
+    File_ids packed from the bot's own session are usable by the Bot API
+    (same account), so direct mode actually works — this is how Tech
+    VJ-style bots do fast direct indexing without any user session."""
+
     BACKFILL_MODE: str = "direct"
     """Backfill method: "direct" packs Bot API file_ids straight from
     channel history (fastest, ~500-1000 files/sec/account, Pyrogram-compatible
