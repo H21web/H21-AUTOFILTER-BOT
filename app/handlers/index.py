@@ -37,6 +37,99 @@ from app.services.textutil import (
 log = logging.getLogger(__name__)
 
 
+
+# ------------------------------------------------- fast batch insert ---
+# For 50-100+ files/sec: channel posts are queued and batch-inserted
+# (one DB roundtrip per ~200 files) instead of one INSERT per file.
+# ON CONFLICT DO NOTHING keeps it dedupe-safe and concurrent-safe.
+
+_save_queue: "asyncio.Queue[dict]" = asyncio.Queue()
+_batch_task: "asyncio.Task | None" = None
+BATCH_SIZE = 200
+BATCH_TIMEOUT = 0.5  # seconds — flush even a partial batch quickly
+
+
+def _extract_record(msg, doc) -> dict | None:
+    """Fast, DB-free extraction of a file record. Returns None if invalid."""
+    file_id = getattr(doc, "file_id", None)
+    if not file_id:
+        return None
+    file_name = _valid_file_name(msg, doc)
+    if not file_name:
+        return None
+    caption = (getattr(msg, "caption", None) or "").strip() or None
+    quality, language = detect_quality_language(f"{file_name} {caption or ''}")
+    return {
+        "file_id": file_id,
+        "file_name": file_name,
+        "file_size": getattr(doc, "file_size", None),
+        "mime_type": getattr(doc, "mime_type", None),
+        "caption": caption,
+        "channel_id": getattr(getattr(msg, "chat", None), "id", None),
+        "message_id": getattr(msg, "message_id", None),
+        "quality": quality,
+        "language": language,
+        "title_key": title_key(file_name),
+        "width": getattr(doc, "width", None),
+        "height": getattr(doc, "height", None),
+        "duration": getattr(doc, "duration", None),
+        "posted_at": getattr(msg, "date", None),
+    }
+
+
+async def _batch_writer() -> None:
+    """Background task: drain queue, batch INSERT with dedupe."""
+    log.info("batch writer started")
+    while True:
+        batch: list[dict] = []
+        try:
+            # Wait for first item (timeout = flush partial batches)
+            try:
+                item = await asyncio.wait_for(_save_queue.get(), BATCH_TIMEOUT)
+                batch.append(item)
+                _save_queue.task_done()
+            except asyncio.TimeoutError:
+                continue
+            # Drain up to BATCH_SIZE without waiting
+            while len(batch) < BATCH_SIZE:
+                try:
+                    batch.append(_save_queue.get_nowait())
+                    _save_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001
+            log.exception("batch writer: queue error")
+            continue
+
+        if not batch:
+            continue
+        try:
+            sf = get_session_factory(settings.DATABASE_URL)
+            async with sf() as s:
+                stmt = pg_insert(File).values(batch).on_conflict_do_nothing(
+                    index_elements=["file_id"])
+                await s.execute(stmt)
+                await s.commit()
+            log.debug("batch writer: inserted %d (dedupe by DB)", len(batch))
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001
+            log.exception("batch writer: insert failed for %d rows", len(batch))
+    log.info("batch writer stopped")
+
+
+def _ensure_batch_writer() -> None:
+    """Start the background batch writer (lazy, idempotent)."""
+    global _batch_task
+    if _batch_task is None or _batch_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        _batch_task = loop.create_task(_batch_writer())
+
 # ------------------------------------------------------------ core save ---
 
 def _valid_file_name(msg, doc) -> str:
@@ -161,8 +254,14 @@ def _get_media(msg):
 
 
 async def on_channel_post(update: Update, context) -> None:
-    """Auto-index new channel posts. Crash-proof wrapper."""
+    """Auto-index new channel posts — FAST PATH via batch queue.
+
+    No DB roundtrip here: extract the record and queue it. The background
+    batch writer inserts ~200 rows per DB call (50-100+ files/sec).
+    Crash-proof: extraction never touches the DB.
+    """
     try:
+        _ensure_batch_writer()
         msg = update.channel_post
         if not msg:
             return
@@ -175,10 +274,14 @@ async def on_channel_post(update: Update, context) -> None:
         # photo comes as a list — take the largest
         if isinstance(doc, (list, tuple)):
             doc = doc[-1]
-        status, file_name, new_title = await save_file(msg, doc, bot=context.bot)
-        log.debug("auto-index: %s %r", status, file_name[:60] if file_name else "")
-        if status == "saved" and new_title:
-            await _post_new_movie_alert(context.bot, file_name)
+        record = _extract_record(msg, doc)
+        if record is None:
+            return
+        try:
+            _save_queue.put_nowait(record)
+        except asyncio.QueueFull:
+            log.warning("auto-index: queue full, dropping %r",
+                        record["file_name"][:60])
     except Exception as exc:  # noqa: BLE001
         log.exception("on_channel_post crashed: %s", exc)
 

@@ -30,7 +30,7 @@ PAGE_SIZE = 200       # messages per get_chat_history call (Telegram max)
 FORWARD_BATCH = 100   # messages per forward_messages call (Telegram max)
 DB_SAVE_EVERY = 1000  # files between DB progress saves
 PROGRESS_EVERY_SEC = 5  # min seconds between Telegram progress edits
-FORWARD_DELAY = 0.5   # seconds between forward calls (flood safety)
+FORWARD_DELAY = 0.2   # seconds between forward calls (flood safety)
 
 _client = None
 _client_lock = asyncio.Lock()
