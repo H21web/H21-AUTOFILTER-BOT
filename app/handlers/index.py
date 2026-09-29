@@ -29,9 +29,8 @@ from app.config import settings
 from app.db import get_session_factory
 from app.models import File
 from app.services.textutil import (
-    detect_language,
-    detect_quality,
-    normalize_title,
+    detect_quality_language,
+    title_key,
 )
 
 log = logging.getLogger(__name__)
@@ -85,20 +84,20 @@ async def save_file(msg, doc, bot=None, source_channel_id=None,
         height = getattr(doc, "height", None)
         duration = getattr(doc, "duration", None)
 
-        quality = detect_quality(file_name, caption or "")
-        language = detect_language(file_name, caption or "")
-        title_key = normalize_title(file_name)
+        quality, language = detect_quality_language(
+            f"{file_name} {caption or ''}")
+        tk = title_key(file_name)
 
         # New-title check (for alerts) — cheap EXISTS query
         is_new_title = False
-        if not quiet and title_key:
+        if not quiet and tk:
             try:
                 sf = get_session_factory()
                 async with sf() as s:
                     exists = await s.scalar(
                         select(func.count())
                         .select_from(File)
-                        .where(File.title_key == title_key))
+                        .where(File.title_key == tk))
                     is_new_title = not exists
             except Exception:  # noqa: BLE001
                 pass
@@ -119,7 +118,7 @@ async def save_file(msg, doc, bot=None, source_channel_id=None,
                 source_message_id=source_message_id,
                 quality=quality,
                 language=language,
-                title_key=title_key,
+                title_key=tk,
                 width=width,
                 height=height,
                 duration=duration,
