@@ -85,7 +85,14 @@ async def _alert_log_channel(bot, text: str) -> None:
 
 async def save_file(msg, doc, bot=None, source_channel_id=None,
                   source_message_id=None, quiet=False) -> tuple[str, str, bool]:
-    """Old-bot style save: validate -> duplicate check -> insert.
+    """Save a file to the DB — validate → duplicate check → insert.
+
+    Mirrors the MoovidexFilterBot (Tech VJ) save_file pattern:
+    - Explicit pre-check for duplicates (by file_id)
+    - Uses INSERT ... ON CONFLICT DO NOTHING RETURNING id so we can
+      reliably detect whether a row was actually written (asyncpg always
+      returns rowcount=-1 for ON CONFLICT DO NOTHING without RETURNING).
+    - DB errors are reported to LOG_CHANNEL and never crash the bot.
 
     source_channel_id/message_id track where a forwarded file came from
     (backfill dedupe). quiet=True skips the new-title alert (backfill floods).
@@ -99,17 +106,18 @@ async def save_file(msg, doc, bot=None, source_channel_id=None,
     file_name = _valid_file_name(msg, doc)
     if not file_name:
         log.debug("auto-index skip: no valid filename (chat %s msg %s)",
-                  msg.chat_id, msg.message_id)
+                  getattr(msg, 'chat_id', '?'), getattr(msg, 'message_id', '?'))
         return "no_name", "", False
 
     file_id = doc.file_id
     log.debug("auto-index processing %r (chat %s msg %s)",
-              file_name, msg.chat_id, msg.message_id)
+              file_name, getattr(msg, 'chat_id', '?'),
+              getattr(msg, 'message_id', '?'))
 
     factory = get_session_factory(settings.DATABASE_URL)
     try:
         async with factory() as session:
-            # explicit duplicate check first (old-bot logic)
+            # Explicit duplicate check first — same as Tech VJ's save_file.
             exists = (await session.execute(
                 select(File.id).where(File.file_id == file_id).limit(1)
             )).first()
@@ -120,45 +128,65 @@ async def save_file(msg, doc, bot=None, source_channel_id=None,
             caption = (msg.caption or "")[:1000]
             quality, language = detect_quality_language(f"{file_name} {caption}")
             tk = title_key(file_name)
-            stmt = pg_insert(File).values(
-                file_id=file_id,
-                file_name=file_name,
-                file_size=getattr(doc, "file_size", None),
-                mime_type=getattr(doc, "mime_type", None),
-                caption=caption or None,
-                channel_id=msg.chat_id,
-                message_id=msg.message_id,
-                source_channel_id=source_channel_id,
-                source_message_id=source_message_id,
-                quality=quality,
-                language=language,
-                title_key=tk or None,
-                width=getattr(doc, "width", None),
-                height=getattr(doc, "height", None),
-                duration=getattr(doc, "duration", None),
-                supports_streaming=getattr(doc, "supports_streaming", None),
-                posted_at=getattr(msg, "date", None),
-                # views/forwards only exist via MTProto, not the Bot API
-                views=None,
-                forwards=None,
-            ).on_conflict_do_nothing(index_elements=["file_id"])
+
+            # INSERT … ON CONFLICT DO NOTHING RETURNING id
+            # asyncpg always yields rowcount=-1 without RETURNING, so we must
+            # use fetchone() to detect whether the row was actually inserted.
+            stmt = (
+                pg_insert(File)
+                .values(
+                    file_id=file_id,
+                    file_name=file_name,
+                    file_size=getattr(doc, "file_size", None),
+                    mime_type=getattr(doc, "mime_type", None),
+                    caption=caption or None,
+                    channel_id=getattr(msg, 'chat_id', None),
+                    message_id=getattr(msg, 'message_id', None),
+                    source_channel_id=source_channel_id,
+                    source_message_id=source_message_id,
+                    quality=quality,
+                    language=language,
+                    title_key=tk or None,
+                    width=getattr(doc, "width", None),
+                    height=getattr(doc, "height", None),
+                    duration=getattr(doc, "duration", None),
+                    supports_streaming=getattr(doc, "supports_streaming", None),
+                    posted_at=getattr(msg, "date", None),
+                    # views/forwards only exist via MTProto, not the Bot API
+                    views=None,
+                    forwards=None,
+                )
+                .on_conflict_do_nothing(index_elements=["file_id"])
+                .returning(File.id)  # <- REQUIRED: rowcount is -1 without this
+            )
             result = await session.execute(stmt)
+            inserted_id = result.fetchone()  # None if conflict (duplicate)
             await session.commit()
-            if not (result.rowcount or 0):
-                # lost a race with a concurrent insert -> treat as duplicate
+
+            if inserted_id is None:
+                # ON CONFLICT fired — a concurrent insert beat us.
                 log.debug("auto-index skip duplicate (race) %r", file_name)
                 return "duplicate", file_name, False
-            log.debug("auto-index saved %r", file_name)
-            new_title = ((not quiet) and bool(tk)
-                         and await _is_new_title(session, tk, file_id))
-            return "saved", file_name, bool(new_title)
+
+            log.info("auto-index saved %r (id=%s)", file_name, inserted_id[0])
+
+        # Check new-title in a fresh session (previous one is already closed).
+        if (not quiet) and bool(tk):
+            async with factory() as session2:
+                new_title = await _is_new_title(session2, tk, file_id)
+        else:
+            new_title = False
+
+        return "saved", file_name, bool(new_title)
+
     except Exception as exc:  # noqa: BLE001
         log.warning("auto-index DB error for %r: %s", file_name, exc)
         await _alert_log_channel(
             bot,
             "🗄️ <b>Auto-index DB error</b>\n"
             f"📄 {_html.escape(file_name)}\n"
-            f"🆔 <code>{msg.chat_id}</code> / msg {msg.message_id}\n"
+            f"🆔 <code>{getattr(msg, 'chat_id', '?')}</code> "
+            f"/ msg {getattr(msg, 'message_id', '?')}\n"
             f"❌ <code>{_html.escape(str(exc))}</code>")
         return "error", file_name, False
 
@@ -206,27 +234,42 @@ async def _post_new_movie_alert(bot, file_name: str) -> None:
 
 async def on_channel_post(update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-index new channel posts — old MoovidexFilterBot logic.
+    """Auto-index new channel posts — Tech VJ / MoovidexFilterBot logic.
 
-    Only channels in INDEX_CHANNELS are processed. The whole handler is
-    wrapped so one bad post can never crash the bot.
+    Matches the reference index.py behaviour:
+    - Only processes channels listed in INDEX_CHANNELS.
+    - Accepts document, video, audio, and video_note attachments.
+    - Calls save_file() which does a proper duplicate check + RETURNING insert.
+    - Posts a new-movie alert to MAIN_CHANNEL_ID on the first file of a title.
+    - The whole handler is wrapped so one bad post never crashes the bot.
     """
     try:
         msg = update.channel_post
         if not msg:
             return
+        if not settings.index_channels:
+            # INDEX_CHANNELS not set — auto-index is disabled.
+            return
         if msg.chat_id not in settings.index_channels:
             log.debug("auto-index ignore post from unlisted channel %s",
                       msg.chat_id)
             return
-        doc = msg.document or msg.video or msg.audio
+        # Accept all media types the reference bot accepts.
+        doc = msg.document or msg.video or msg.audio or msg.video_note
         if doc is None:
             return
-        status, file_name, new_title = await save_file(msg, doc,
-                                                       bot=context.bot)
-        log.debug("auto-index result: %s %r", status, file_name)
-        if status == "saved" and new_title:
-            await _post_new_movie_alert(context.bot, file_name)
+        status, file_name, new_title = await save_file(
+            msg, doc, bot=context.bot)
+        if status == "saved":
+            log.info("auto-index [%s] saved %r", msg.chat_id, file_name)
+            if new_title:
+                await _post_new_movie_alert(context.bot, file_name)
+        elif status == "duplicate":
+            log.debug("auto-index [%s] duplicate %r", msg.chat_id, file_name)
+        elif status == "no_name":
+            log.debug("auto-index [%s] no_name msg %s",
+                      msg.chat_id, msg.message_id)
+        # "error" is already logged + alerted inside save_file.
     except Exception as exc:  # noqa: BLE001 - never let a post kill the bot
         log.exception("auto-index unexpected error (caught): %s", exc)
         try:
