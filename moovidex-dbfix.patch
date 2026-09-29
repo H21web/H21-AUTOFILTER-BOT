@@ -1,0 +1,22 @@
+diff --git a/app/handlers/index.py b/app/handlers/index.py
+index 2b562a7..53c36c0 100644
+--- a/app/handlers/index.py
++++ b/app/handlers/index.py
+@@ -93,7 +93,7 @@ async def save_file(msg, doc, bot=None, source_channel_id=None,
+         is_new_title = False
+         if not quiet and tk:
+             try:
+-                sf = get_session_factory()
++                sf = get_session_factory(settings.DATABASE_URL)
+                 async with sf() as s:
+                     exists = await s.scalar(
+                         select(func.count())
+@@ -105,7 +105,7 @@ async def save_file(msg, doc, bot=None, source_channel_id=None,
+ 
+         # Insert with ON CONFLICT DO NOTHING — DB handles dedupe atomically.
+         # Fast even with lakhs of rows (unique index on file_id).
+-        sf = get_session_factory()
++        sf = get_session_factory(settings.DATABASE_URL)
+         async with sf() as s:
+             stmt = pg_insert(File).values(
+                 file_id=file_id,
