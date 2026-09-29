@@ -106,6 +106,28 @@ def _resolve_chat(ref: str):
         return ref  # @username
 
 
+async def _get_chat(client, ref):
+    """Resolve channel ref -> chat. Handles private channels.
+
+    Pyrogram can't resolve a raw -100 id unless the peer is in the
+    session cache. For private channels we scan dialogs once to
+    populate it (one-time cost at job start).
+    """
+    target = _resolve_chat(ref)
+    if isinstance(target, int):
+        try:
+            return await client.get_chat(target)
+        except ValueError:
+            pass  # not in cache — scan dialogs
+        async for dialog in client.get_dialogs():
+            if dialog.chat.id == target:
+                return dialog.chat
+        raise ValueError(
+            f"Channel {target} not found. The session account must be "
+            "a MEMBER of this private channel.")
+    return await client.get_chat(target)
+
+
 def _is_media(msg) -> bool:
     return bool(getattr(msg, "document", None)
                or getattr(msg, "video", None)
@@ -211,7 +233,7 @@ async def _run_job(job_id: int, progress_cb=None) -> None:
 
     try:
         client = await get_client()
-        chat = await client.get_chat(_resolve_chat(channel_ref))
+        chat = await _get_chat(client, channel_ref)
 
         # Dump target: first INDEX_CHANNEL (bot must see it as a channel post)
         dump_targets = settings.index_channels

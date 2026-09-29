@@ -1,40 +1,42 @@
-diff --git a/app/services/indexer.py b/app/services/indexer.py
-index 272ce53..14f3614 100644
---- a/app/services/indexer.py
-+++ b/app/services/indexer.py
-@@ -80,10 +80,32 @@ async def resolve_channel(ref: str) -> dict:
-     """Resolve ref -> {ref, chat_id, title, last_msg_id}. Raises on error."""
-     client = await get_client()
-     ref = parse_channel_ref(ref)
+diff --git a/app/services/backfill.py b/app/services/backfill.py
+index 065bafc..1a466c5 100644
+--- a/app/services/backfill.py
++++ b/app/services/backfill.py
+@@ -106,6 +106,28 @@ def _resolve_chat(ref: str):
+         return ref  # @username
+ 
+ 
++async def _get_chat(client, ref):
++    """Resolve channel ref -> chat. Handles private channels.
 +
-+    # Populate peer cache first (in-memory session starts empty —
-+    # without this, get_chat on a -100 id throws "Peer id invalid").
++    Pyrogram can't resolve a raw -100 id unless the peer is in the
++    session cache. For private channels we scan dialogs once to
++    populate it (one-time cost at job start).
++    """
++    target = _resolve_chat(ref)
++    if isinstance(target, int):
++        try:
++            return await client.get_chat(target)
++        except ValueError:
++            pass  # not in cache — scan dialogs
++        async for dialog in client.get_dialogs():
++            if dialog.chat.id == target:
++                return dialog.chat
++        raise ValueError(
++            f"Channel {target} not found. The session account must be "
++            "a MEMBER of this private channel.")
++    return await client.get_chat(target)
++
++
+ def _is_media(msg) -> bool:
+     return bool(getattr(msg, "document", None)
+                or getattr(msg, "video", None)
+@@ -211,7 +233,7 @@ async def _run_job(job_id: int, progress_cb=None) -> None:
+ 
      try:
--        chat = await client.get_chat(ref)
--    except Exception:
--        chat = await client.get_chat(int(ref))
-+        async for _ in client.get_dialogs(limit=50):
-+            break
-+    except Exception:  # noqa: BLE001
-+        pass
-+
-+    chat = None
-+    last_err = None
-+    for attempt in (ref,):
-+        try:
-+            chat = await client.get_chat(attempt)
-+            break
-+        except Exception as e:  # noqa: BLE001
-+            last_err = e
-+    if chat is None:
-+        try:
-+            chat = await client.get_chat(int(ref))
-+        except Exception as e:  # noqa: BLE001
-+            last_err = e
-+    if chat is None:
-+        raise RuntimeError(
-+            f"Peer id invalid: {ref}. Bot must be a MEMBER of the channel "
-+            f"(add it first, then retry). Details: {last_err}")
-     last = 0
-     async for m in client.get_chat_history(chat.id, limit=1):
-         last = m.id
+         client = await get_client()
+-        chat = await client.get_chat(_resolve_chat(channel_ref))
++        chat = await _get_chat(client, channel_ref)
+ 
+         # Dump target: first INDEX_CHANNEL (bot must see it as a channel post)
+         dump_targets = settings.index_channels
