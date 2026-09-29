@@ -1,6 +1,7 @@
 # Pinned runtime dependencies (Python 3.11+).
 python-telegram-bot==21.6
 pyrogram>=2.0  # backfill engine only (user-session history walk)
+tgcrypto>=1.2  # Pyrogram speedup (1M-file backfill needs this)
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 SQLAlchemy==2.0.36
