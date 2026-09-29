@@ -1,0 +1,76 @@
+diff --git a/app/handlers/index.py b/app/handlers/index.py
+index 1db20d7..b567ebc 100644
+--- a/app/handlers/index.py
++++ b/app/handlers/index.py
+@@ -334,8 +334,11 @@ async def index_command(update: Update, context) -> None:
+     if not idx.indexer_configured():
+         await msg.reply_text(
+             "⚠️ <b>Indexer not configured.</b>\n\n"
+-            "Set <code>INDEXER_BOT_MODE=true</code>, <code>TG_API_ID</code>, "
+-            "<code>TG_API_HASH</code>, <code>INDEX_CHANNELS</code> and restart.",
++            "Backfill needs a <b>user session</b> (bots can't read history — "
++            "Telegram restriction):\n"
++            "Set <code>TG_SESSION</code> + <code>TG_API_ID</code> + "
++            "<code>TG_API_HASH</code> + <code>INDEX_CHANNELS</code> and restart.\n\n"
++            "Use <code>make-session.py</code> on your PC to generate TG_SESSION.",
+             parse_mode="HTML")
+         return
+ 
+diff --git a/app/services/indexer.py b/app/services/indexer.py
+index 14f3614..3080a35 100644
+--- a/app/services/indexer.py
++++ b/app/services/indexer.py
+@@ -27,36 +27,44 @@ _run_lock = asyncio.Lock()
+ 
+ 
+ async def get_client():
+-    """Pyrogram bot client singleton (in-memory session)."""
++    """Pyrogram USER client singleton (in-memory session).
++
++    NOTE: Bots CANNOT read channel history (Telegram blocks
++    messages.GetHistory for bots — BOT_METHOD_INVALID). A user
++    session is REQUIRED for backfill. This is why Tech VJ uses
++    a user session too.
++    """
+     global _client
+     if _client is None:
+         async with _client_lock:
+             if _client is None:
+                 from pyrogram import Client
+                 from app.config import settings
+-                if not (settings.BOT_TOKEN and settings.TG_API_ID
++                sessions = settings.tg_sessions
++                if not (sessions and settings.TG_API_ID
+                         and settings.TG_API_HASH):
+                     raise RuntimeError(
+-                        "indexer not configured: BOT_TOKEN + TG_API_ID + "
+-                        "TG_API_HASH required")
++                        "backfill needs a USER session: set TG_SESSION "
++                        "(or TG_SESSIONS) + TG_API_ID + TG_API_HASH. "
++                        "Bots cannot read channel history (Telegram restriction).")
+                 _client = Client(
+                     "moovidex_indexer",
+                     api_id=int(settings.TG_API_ID),
+                     api_hash=settings.TG_API_HASH,
+-                    bot_token=settings.BOT_TOKEN,
++                    session_string=sessions[0],
+                     in_memory=True,
+                 )
+                 await _client.start()
+                 me = await _client.get_me()
+-                log.info("indexer logged in as @%s (%s)", me.username, me.id)
++                log.info("indexer logged in as %s (%s)",
++                         getattr(me, "username", me.id), me.id)
+     return _client
+ 
+ 
+ def indexer_configured() -> bool:
+     from app.config import settings
+-    return bool(settings.INDEXER_BOT_MODE and settings.BOT_TOKEN
+-                and settings.TG_API_ID and settings.TG_API_HASH
+-                and settings.index_channels)
++    return bool(settings.tg_sessions and settings.TG_API_ID
++                and settings.TG_API_HASH and settings.index_channels)
+ 
+ 
+ def parse_channel_ref(raw: str) -> str:
