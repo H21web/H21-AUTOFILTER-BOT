@@ -169,14 +169,18 @@ async def _save_progress(job_id: int, prog: JobProgress,
 async def create_job(channel_ref: str, skip: int = 0,
                      min_id: int = 0, max_id: int = 0) -> int:
     """Insert a pending job row, return its id."""
+    import uuid
     from app.db import get_session_factory
     from app.config import settings
     from app.models import BackfillJob
 
     factory = get_session_factory(settings.DATABASE_URL)
     async with factory() as s:
-        job = BackfillJob(channel_ref=channel_ref, skip=skip,
-                          min_id=min_id, max_id=max_id, status="pending")
+        job = BackfillJob(
+            run_token=f"bf-{uuid.uuid4().hex[:12]}",
+            channel_ref=channel_ref, skip=skip,
+            min_id=min_id, max_id=max_id, status="pending",
+        )
         s.add(job)
         await s.commit()
         await s.refresh(job)
