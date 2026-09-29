@@ -1,0 +1,2202 @@
+diff --git a/app/handlers/index.py b/app/handlers/index.py
+index 0f1332a..01076e7 100644
+--- a/app/handlers/index.py
++++ b/app/handlers/index.py
+@@ -361,744 +361,158 @@ async def on_admin_pm_media(update: Update,
+         _finalize_index_summary(context.bot, msg.chat_id, data))
+ 
+ 
+-async def index_command(update: Update,
+-                        context: ContextTypes.DEFAULT_TYPE) -> None:
+-    """/index — admin: control panel (or /index <channel> quick backfill).
+-
+-    Non-admins (PM only): request a channel for indexing — moderators
+-    approve/reject in LOG_CHANNEL.
+-    """
+-    user = update.effective_user
+-    uid = user.id if user else 0
+-    if not is_admin(uid):
+-        if update.effective_chat.type != "private":
+-            await update.effective_message.reply_text(
+-                "💡 <i>PM-il vannu /index adicholu.</i>", parse_mode="HTML")
+-            return
+-        await _start_index_request(update, context)
+-        return
+-    if context.args:
+-        await _quick_index_flow(update, context, " ".join(context.args))
+-        return
+-    text, kb = await _panel_data(uid)
+-    msg = await update.effective_message.reply_text(
+-        text, parse_mode="HTML", reply_markup=kb)
+-    if user:
+-        _IDX_PANEL[uid] = (msg.chat_id, msg.message_id)
+-
+-
+-# ------------------------------------------ server-side channel backfill ---
+-
+-import secrets as _secrets
+ 
+-_PENDING_INDEX: dict[str, dict] = {}
+-_INDEX_RUNS: dict[str, dict] = {}
+-_INDEX_CFG: dict[int, dict] = {}
+-_IDX_AWAIT: dict[int, str] = {}
+-_IDX_PANEL: dict[int, tuple[int, int]] = {}
+-
+-
+-def _get_cfg(admin_id: int) -> dict:
+-    """Per-admin backfill settings (in-memory; resets on bot restart)."""
+-    return _INDEX_CFG.setdefault(
+-        admin_id,
+-        {"channels": [], "skip": 0, "from_id": 0, "to_id": 0, "limit": 0},
+-    )
+-
+-
+-def _cfg_summary(cfg: dict) -> str:
+-    rng = (f"{cfg['from_id']}–{cfg['to_id']}"
+-           if cfg["from_id"] or cfg["to_id"] else "full history")
+-    lim = str(cfg["limit"]) if cfg["limit"] else "no limit"
+-    return (f"📡 Channels: <b>{len(cfg['channels'])}</b>\n"
+-            f"⏭️ Skip first: <b>{cfg['skip']}</b> file(s) per channel\n"
+-            f"↔️ Range: <b>{rng}</b>\n"
+-            f"🔢 Max files: <b>{lim}</b>")
+ 
++# ------------------------------------------ fresh /index (simple + fast) ---
+ 
+ def _setup_text() -> str:
+     return (
+-        "⚠️ <b>Channel backfill isn't configured.</b>\n\n"
+-        "The server needs a dedicated indexer account:\n"
+-        "1. Run <code>make-session.py</code> on your PC with a spare Telegram account.\n"
+-        "2. Set <code>TG_SESSION</code>, <code>TG_API_ID</code>, "
+-        "<code>TG_API_HASH</code>, <code>INDEXER_IDS</code> in the site's "
+-        "environment and restart.\n"
+-        "3. Have that account /start the bot once.\n\n"
+-        "Until then, forward files to me in PM to index them.")
+-
+-
+-async def _panel_data(admin_id: int) -> tuple[str, InlineKeyboardMarkup]:
+-    from app.services import mtproto_index
+-    factory = get_session_factory(settings.DATABASE_URL)
+-    async with factory() as session:
+-        total = (await session.execute(select(func.count())
+-                                       .select_from(File))).scalar() or 0
+-        channels = (await session.execute(
+-            select(func.count(func.distinct(File.channel_id)))
+-        )).scalar() or 0
+-    cfg = _get_cfg(admin_id)
+-    auto = ("✅ ready"
+-            if mtproto_index.indexer_configured() else
+-            "⚠️ not configured — set TG_SESSION on the server")
+-    text = (
+-        "📥 <b>Index control panel</b>\n\n"
+-        "1️⃣ <b>Auto</b> — new files posted in INDEX_CHANNELS are indexed "
+-        "automatically (set the env var; empty = channel auto-index off).\n"
+-        "2️⃣ <b>Manual</b> — forward files/channel posts to me here in PM "
+-        "(multi-select up to 100 at once), or upload files directly.\n"
+-        f"3️⃣ <b>Backfill</b> — {auto}.\n\n"
+-        f"{_cfg_summary(cfg)}\n\n"
+-        f"📁 Files indexed: <b>{total}</b>  •  📡 Source chats: <b>{channels}</b>")
+-    kb = InlineKeyboardMarkup([
+-        [InlineKeyboardButton("➕ Add channel", callback_data="idx:add"),
+-         InlineKeyboardButton(f"📋 Channels ({len(cfg['channels'])})",
+-                              callback_data="idx:list")],
+-        [InlineKeyboardButton(f"⏭ Skip: {cfg['skip']}",
+-                              callback_data="idx:skip"),
+-         InlineKeyboardButton("↔️ Range", callback_data="idx:range")],
+-        [InlineKeyboardButton(f"🔢 Limit: {cfg['limit'] or '∞'}",
+-                              callback_data="idx:limit"),
+-         InlineKeyboardButton("🔄 Reset", callback_data="idx:reset")],
+-        [InlineKeyboardButton("▶️ Start indexing", callback_data="idx:start")],
+-    ])
+-    return text, kb
+-
+-
+-async def _edit_panel(query, admin_id: int) -> None:
+-    text, kb = await _panel_data(admin_id)
+-    try:
+-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+-    except Exception:  # noqa: BLE001
+-        pass
+-
++        "⚠️ <b>Channel indexer isn't configured.</b>\n\n"
++        "Set these env vars and restart:\n"
++        "1. <code>INDEXER_BOT_MODE=true</code>\n"
++        "2. <code>BOT_TOKEN</code>, <code>TG_API_ID</code>, "
++        "<code>TG_API_HASH</code>\n"
++        "3. <code>INDEX_CHANNELS</code> — dump channel ID (bot must be admin)\n\n"
++        "The bot must also be a member of the source channel.")
+ 
+-def _bar(pct: float, width: int = 12) -> str:
+-    pct = max(0.0, min(1.0, pct))
+-    fill = int(round(pct * width))
+-    return "▓" * fill + "░" * (width - fill)
+ 
++async def index_command(update: Update,
++                        context: ContextTypes.DEFAULT_TYPE) -> None:
++    """Fresh /index — simple channel backfill.
+ 
+-async def _quick_index_flow(update: Update, context: ContextTypes.DEFAULT_TYPE,
+-                            raw_ref: str) -> None:
+-    """Resolve one channel and ask for confirmation (admin only)."""
+-    from app.services import mtproto_index
+-    msg = update.effective_message
+-    uid = update.effective_user.id if update.effective_user else 0
+-    if not mtproto_index.indexer_configured():
+-        await msg.reply_text(_setup_text(), parse_mode="HTML")
+-        return
+-    ref, hint = mtproto_index.parse_channel_ref(raw_ref)
+-    wait = await msg.reply_text("🔍 <i>Resolving channel…</i>", parse_mode="HTML")
+-    try:
+-        info = await mtproto_index.resolve_channel(ref)
+-    except Exception as exc:  # noqa: BLE001
+-        await wait.edit_text(
+-            f"❌ Couldn't read that channel: <code>{_html.escape(str(exc))}</code>\n"
+-            "Make sure the indexer account can access it.", parse_mode="HTML")
+-        return
+-    last = hint or info["last_msg_id"]
+-    cfg = _get_cfg(uid)
+-    token = _secrets.token_hex(4)
+-    _PENDING_INDEX[token] = {"channels": [ref], "cfg": dict(cfg),
+-                             "chat_id": msg.chat_id}
+-    kb = InlineKeyboardMarkup([
+-        [InlineKeyboardButton("✅ Yes, index it",
+-                              callback_data=f"idx:go:{token}")],
+-        [InlineKeyboardButton("❌ Cancel", callback_data=f"idx:no:{token}")],
+-    ])
+-    await wait.edit_text(
+-        f"📥 <b>Index this channel?</b>\n\n"
+-        f"📌 {_html.escape(info['title'])}\n"
+-        f"🆔 <code>{info['chat_id']}</code>\n"
+-        f"🔢 Last message: <b>{last}</b>\n\n"
+-        f"{_cfg_summary(cfg)}\n\n"
+-        "<i>Every video/audio/document will be indexed directly from history. "
+-        "Change skip/range/limit from the /index panel first if needed.</i>",
+-        parse_mode="HTML", reply_markup=kb)
+-
++    /index <channel> — start indexing (admin only)
++    /index — show status
++    /index cancel — stop the running index
++    """
++    from app.services import indexer as idx
+ 
+-async def _on_index_callback(update: Update,
+-                             context: ContextTypes.DEFAULT_TYPE) -> None:
+-    query = update.callback_query
+     user = update.effective_user
+-    uid = user.id if user else None
+-    if not query or not is_admin(uid):
+-        if query:
+-            await query.answer("⛔ Admins only.", show_alert=True)
+-        return
+-    await query.answer()
+-    parts = (query.data or "").split(":")
+-    action = parts[1] if len(parts) > 1 else ""
+-    arg = parts[2] if len(parts) > 2 else ""
+-
+-    if action == "cancel":
+-        # cancel a running backfill (workers + DB jobs)
+-        from app.services import mtproto_index
+-        run = _INDEX_RUNS.get(arg)
+-        if run:
+-            run["event"].set()
+-        try:
+-            await mtproto_index.cancel_run(arg)
+-        except Exception:  # noqa: BLE001
+-            pass
+-        await query.answer("Cancelling…", show_alert=True)
++    uid = user.id if user else 0
++    msg = update.effective_message
++    if not is_admin(uid):
++        await msg.reply_text(
++            "⛔ Admins only. Search-il movie name adicholu. 🔍",
++            parse_mode="HTML")
+         return
+ 
+-    if action in ("reqaccept", "reqreject"):
+-        # moderator decision on a user-submitted index request
+-        req = _REQ_INDEX.pop(arg, None)
+-        if not req:
+-            await query.answer("⚠️ Expired.", show_alert=True)
+-            return
+-        mod = (update.effective_user.full_name
+-               if update.effective_user else "moderator")
+-        title = req["title"]
+-        if action == "reqreject":
+-            try:
+-                await query.edit_message_text(
+-                    f"❌ <b>Rejected</b> by {_html.escape(mod)}\n"
+-                    f"📌 {_html.escape(title)}",
+-                    parse_mode="HTML")
+-            except Exception:  # noqa: BLE001
+-                pass
+-            try:
+-                await context.bot.send_message(
+-                    req["from_user"],
+-                    f"❌ Your indexing request for <b>{_html.escape(title)}</b> "
+-                    f"was declined by the moderators.",
+-                    parse_mode="HTML")
+-            except Exception:  # noqa: BLE001
+-                pass
+-            await query.answer("Rejected.")
+-            return
+-        # accepted: queue the channel into the parallel backfill engine
+-        try:
+-            await query.edit_message_text(
+-                f"✅ <b>Accepted</b> by {_html.escape(mod)} — indexing…\n"
+-                f"📌 {_html.escape(title)}",
+-                parse_mode="HTML")
+-        except Exception:  # noqa: BLE001
+-            pass
+-        try:
+-            await context.bot.send_message(
+-                req["from_user"],
+-                f"✅ Your request for <b>{_html.escape(title)}</b> was "
+-                f"<b>accepted</b>! Files will be indexed soon.",
++    args = context.args or []
++    if not args:
++        st = idx.run_status()
++        if st:
++            s = st.get("stats", {})
++            await msg.reply_text(
++                f"📥 <b>Indexing:</b> {_html.escape(st.get('title', ''))}\n"
++                f"🔍 Scanned: <b>{s.get('scanned', 0)}</b> | "
++                f"📤 Forwarded: <b>{s.get('forwarded', 0)}</b>\n\n"
++                f"<i>/index cancel — to stop</i>",
+                 parse_mode="HTML")
+-        except Exception:  # noqa: BLE001
+-            pass
+-        token = _secrets.token_hex(4)
+-        await query.answer("Accepted — starting backfill.")
+-        await _begin_backfill(
+-            context, token, [req["ref"]],
+-            {"channels": [req["ref"]], "skip": 0, "from_id": 0,
+-             "to_id": 0, "limit": 0},
+-            chat_id=settings.log_channel_id)
+-        return
+-
+-    cfg = _get_cfg(uid)
+-
+-    if action == "add":
+-        if query.message.chat.type != "private":
+-            await query.answer("Open my PM to add channels.", show_alert=True)
+-            return
+-        _IDX_AWAIT[uid] = "channel"
+-        await query.message.reply_text(
+-            "📡 <b>Send the channel</b>\n"
+-            "• Private channel → its <b>-100 ID</b> "
+-            "(e.g. <code>-1001234567890</code>),\n"
+-            "  or copy any message link from it (<code>t.me/c/…/…</code>)\n"
+-            "• Public channel → @username or t.me link\n"
+-            "Send /cancel to abort.", parse_mode="HTML")
+-        return
+-
+-    if action == "list":
+-        if not cfg["channels"]:
+-            await query.answer("No channels added yet — tap ➕ Add channel.",
+-                               show_alert=True)
+-            return
+-        rows = [[InlineKeyboardButton(f"❌ {c}", callback_data=f"idx:rm:{i}")]
+-                for i, c in enumerate(cfg["channels"])]
+-        rows.append([InlineKeyboardButton("◀️ Back", callback_data="idx:back")])
+-        await query.edit_message_text(
+-            "📡 <b>Channels queued:</b>\n<i>Tap ❌ to remove one.</i>",
+-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+-        return
+-
+-    if action == "rm":
+-        try:
+-            cfg["channels"].pop(int(arg))
+-        except (ValueError, IndexError):
+-            pass
+-        if cfg["channels"]:
+-            rows = [[InlineKeyboardButton(f"❌ {c}", callback_data=f"idx:rm:{i}")]
+-                    for i, c in enumerate(cfg["channels"])]
+-            rows.append([InlineKeyboardButton("◀️ Back",
+-                                              callback_data="idx:back")])
+-            try:
+-                await query.edit_message_text(
+-                    "📡 <b>Channels queued:</b>\n<i>Tap ❌ to remove one.</i>",
+-                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+-            except Exception:  # noqa: BLE001
+-                pass
+-        else:
+-            await _edit_panel(query, uid)
+-        return
+-
+-    if action in ("skip", "range", "limit"):
+-        if query.message.chat.type != "private":
+-            await query.answer("Open my PM to change settings.",
+-                               show_alert=True)
+-            return
+-        _IDX_AWAIT[uid] = action
+-        prompts = {
+-            "skip": ("⏭️ <b>Skip files</b>\n\nHow many files to skip from the "
+-                     "newest, per channel? (0 = none)\n/cancel to abort."),
+-            "range": ("↔️ <b>Message range</b>\n\nSend <code>from_id to_id</code> "
+-                      "— e.g. <code>100 500</code> — to index only that range.\n"
+-                      "Send <code>0 0</code> for full history.\n/cancel to abort."),
+-            "limit": ("🔢 <b>Max files</b>\n\nHow many files to index in total? "
+-                      "(0 = no limit)\n/cancel to abort."),
+-        }
+-        await query.message.reply_text(prompts[action], parse_mode="HTML")
+-        return
+-
+-    if action == "reset":
+-        _INDEX_CFG[uid] = {"channels": [], "skip": 0, "from_id": 0,
+-                           "to_id": 0, "limit": 0}
+-        await _edit_panel(query, uid)
+-        await query.answer("Settings reset ✓")
+-        return
+-
+-    if action == "start":
+-        from app.services import mtproto_index
+-        if not mtproto_index.indexer_configured():
+-            await query.message.reply_text(_setup_text(), parse_mode="HTML")
+-            return
+-        if not cfg["channels"]:
+-            await query.answer("Add a channel first! ➕", show_alert=True)
+-            return
+-        token = _secrets.token_hex(4)
+-        _PENDING_INDEX[token] = {"channels": list(cfg["channels"]),
+-                                 "cfg": dict(cfg),
+-                                 "chat_id": query.message.chat_id}
+-        ch_lines = "\n".join(f"• <code>{_html.escape(c)}</code>"
+-                             for c in cfg["channels"])
+-        kb = InlineKeyboardMarkup([
+-            [InlineKeyboardButton("✅ Yes, start",
+-                                  callback_data=f"idx:go:{token}")],
+-            [InlineKeyboardButton("❌ Cancel", callback_data=f"idx:no:{token}")],
+-        ])
+-        await query.edit_message_text(
+-            f"📥 <b>Start backfill?</b>\n\n{ch_lines}\n\n{_cfg_summary(cfg)}\n\n"
+-            "<i>Media will be indexed directly from history.</i>",
+-            parse_mode="HTML", reply_markup=kb)
+-        return
+-
+-    if action == "go":
+-        params = _PENDING_INDEX.pop(arg, None)
+-        if not params:
+-            await query.edit_message_text("⚠️ <i>Expired — run /index again.</i>",
+-                                          parse_mode="HTML")
+-            return
+-        await _launch_index_run(query, context, arg, params["channels"],
+-                                params["cfg"])
+-        return
+-
+-    if action in ("no", "back"):
+-        _PENDING_INDEX.pop(arg, None)
+-        await _edit_panel(query, uid)
+-        return
+-
+-
+-class _AwaitingFilter(filters.MessageFilter):
+-    """Matches private text only while that admin is mid-settings-input.
+-
+-    Registered before the search text handler (same group): when it matches,
+-    this input is consumed here and never reaches search.
+-    """
+-
+-    def filter(self, message) -> bool:
+-        u = message.from_user
+-        return bool(u and is_admin(u.id) and _IDX_AWAIT.get(u.id))
+-
+-
+-async def _on_idx_text_input(update: Update,
+-                             context: ContextTypes.DEFAULT_TYPE) -> None:
+-    """Consume one settings value for the /index panel (admin, PM only)."""
+-    from app.services import mtproto_index
+-    uid = update.effective_user.id
+-    kind = _IDX_AWAIT.get(uid)
+-    if not kind:
+-        return
+-    msg = update.effective_message
+-    text = (msg.text or "").strip()
+-    cfg = _get_cfg(uid)
+-
+-    async def refresh(note: str) -> None:
+-        _IDX_AWAIT.pop(uid, None)
+-        await msg.reply_text(note, parse_mode="HTML")
+-        panel = _IDX_PANEL.get(uid)
+-        if panel:
+-            ptext, pkb = await _panel_data(uid)
+-            try:
+-                await context.bot.edit_message_text(
+-                    ptext, chat_id=panel[0], message_id=panel[1],
+-                    parse_mode="HTML", reply_markup=pkb)
+-            except Exception:  # noqa: BLE001
+-                pass
+-
+-    if kind == "channel":
+-        ref, _ = mtproto_index.parse_channel_ref(text)
+-        if ref in cfg["channels"]:
+-            await refresh(f"ℹ️ <code>{_html.escape(ref)}</code> is already queued.")
+         else:
+-            cfg["channels"].append(ref)
+-            await refresh(f"✅ Queued <code>{_html.escape(ref)}</code>.")
+-        return
+-    if kind in ("skip", "limit"):
+-        if not text.isdigit():
+-            await msg.reply_text("🔢 Numbers only please — try again or /cancel.",
+-                                 parse_mode="HTML")
+-            return
+-        cfg[kind] = int(text)
+-        label = {"skip": "Skip", "limit": "Max files"}[kind]
+-        await refresh(f"✅ {label} set to <b>{int(text)}</b>.")
+-        return
+-    if kind == "range":
+-        nums: list[str] = []
+-        for tok in _re.split(r"[\s,]+", text):
+-            nums.extend(p for p in tok.split("-") if p)
+-        if len(nums) != 2 or not all(n.isdigit() for n in nums):
+             await msg.reply_text(
+-                "↔️ Send as <code>from_id to_id</code> — e.g. <code>100 500</code> "
+-                "— or /cancel.", parse_mode="HTML")
+-            return
+-        a, b = int(nums[0]), int(nums[1])
+-        if a > b:
+-            await msg.reply_text("↔️ from_id should be ≤ to_id — try again or /cancel.",
+-                                 parse_mode="HTML")
+-            return
+-        cfg["from_id"], cfg["to_id"] = a, b
+-        await refresh(f"✅ Range set to <b>{a}–{b}</b>."
+-                      if (a or b) else "✅ Range reset to full history.")
++                "📥 <b>Channel Indexer</b>\n\n"
++                "Usage: <code>/index @channel</code> or "
++                "<code>/index https://t.me/channel</code>\n\n"
++                "The bot walks the channel history and forwards media to "
++                "the dump channel — files get indexed with native Bot API "
++                "file_ids automatically.",
++                parse_mode="HTML")
+         return
+ 
+-
+-async def _on_idx_cancel_cmd(update: Update,
+-                             context: ContextTypes.DEFAULT_TYPE) -> None:
+-    """Abort a pending /index settings input or index request."""
+-    user = update.effective_user
+-    uid = user.id if user else None
+-    if not uid or (uid not in _IDX_AWAIT and uid not in _REQ_AWAIT):
++    if args[0].lower() == "cancel":
++        stopped = await idx.cancel_run()
++        await msg.reply_text(
++            "🛑 Indexing cancelled." if stopped else "No active index run.")
+         return
+-    _IDX_AWAIT.pop(uid, None)
+-    _REQ_AWAIT.discard(uid)
+-    await update.effective_message.reply_text("🚫 <i>Input cancelled.</i>",
+-                                              parse_mode="HTML")
+-    panel = _IDX_PANEL.get(uid)
+-    if panel:
+-        ptext, pkb = await _panel_data(uid)
+-        try:
+-            await context.bot.edit_message_text(
+-                ptext, chat_id=panel[0], message_id=panel[1],
+-                parse_mode="HTML", reply_markup=pkb)
+-        except Exception:  # noqa: BLE001
+-            pass
+-
+-
+-# --------------------------------- moderator approval workflow ---
+-
+-_REQ_AWAIT: set[int] = set()      # user ids composing an index request
+-_REQ_INDEX: dict[str, dict] = {}  # token -> pending request
+ 
+-
+-async def _start_index_request(update: Update,
+-                               context: ContextTypes.DEFAULT_TYPE) -> None:
+-    """Non-admin /index (PM): ask for the channel to request."""
+-    from app.services import mtproto_index
+-    user = update.effective_user
+-    uid = user.id if user else 0
+-    msg = update.effective_message
+-    if not mtproto_index.indexer_configured():
+-        await msg.reply_text(
+-            "⚠️ <i>Indexing isn't set up on the server yet — try again later.</i>",
+-            parse_mode="HTML")
++    if not idx.indexer_configured():
++        await msg.reply_text(_setup_text(), parse_mode="HTML")
+         return
+-    if not settings.log_channel_id:
++
++    if idx.run_status():
+         await msg.reply_text(
+-            "⚠️ <i>Index requests aren't set up yet (no LOG_CHANNEL).</i>",
++            "⚠️ An index run is already active. "
++            "<i>/index cancel</i> to stop it first.",
+             parse_mode="HTML")
+         return
+-    _REQ_AWAIT.add(uid)
+-    await msg.reply_text(
+-        "📥 <b>Request a channel for indexing</b>\n\n"
+-        "Send the channel's <b>last post link</b> "
+-        "(e.g. <code>t.me/c/123…/456</code>),\n"
+-        "or simply <b>forward any message</b> from that channel here.\n\n"
+-        "Moderators will review it. /cancel to abort.",
+-        parse_mode="HTML")
+ 
+-
+-class _ReqAwaitFilter(filters.MessageFilter):
+-    """Matches PM text/forwards while the user is composing an index request."""
+-
+-    def filter(self, message) -> bool:
+-        u = message.from_user
+-        return bool(u and u.id in _REQ_AWAIT
+-                    and (message.text or message.forward_from_chat))
+-
+-
+-async def _on_req_input(update: Update,
+-                        context: ContextTypes.DEFAULT_TYPE) -> None:
+-    """Consume one index-request input (link or forwarded channel message)."""
+-    from app.services import mtproto_index
+-    user = update.effective_user
+-    uid = user.id if user else 0
+-    msg = update.effective_message
+-    _REQ_AWAIT.discard(uid)
+-
+-    ref = None
+-    if msg.forward_from_chat and getattr(msg.forward_from_chat, "type",
+-                                         None) == "channel":
+-        fwd = msg.forward_from_chat
+-        ref = f"@{fwd.username}" if getattr(fwd, "username", None) else str(fwd.id)
+-    elif msg.text:
+-        ref, _ = mtproto_index.parse_channel_ref(msg.text)
+-    if not ref:
+-        await msg.reply_text("❌ <i>Send a channel link or forward a "
+-                             "channel message. Try /index again.</i>",
+-                             parse_mode="HTML")
+-        return
++    raw_ref = " ".join(args)
++    wait = await msg.reply_text("🔍 <i>Resolving channel…</i>",
++                                parse_mode="HTML")
+     try:
+-        info = await mtproto_index.resolve_channel(ref)
++        info = await idx.resolve_channel(raw_ref)
+     except Exception as exc:  # noqa: BLE001
+-        await msg.reply_text(
++        await wait.edit_text(
+             f"❌ Couldn't read that channel: "
+-            f"<code>{_html.escape(str(exc))}</code>\n"
+-            f"<i>Try /index again.</i>", parse_mode="HTML")
+-        return
+-
+-    token = _secrets.token_hex(4)
+-    _REQ_INDEX[token] = {
+-        "ref": ref, "title": info["title"], "chat_id": info["chat_id"],
+-        "last_msg_id": info["last_msg_id"],
+-        "from_user": uid,
+-        "from_name": (user.full_name if user else str(uid)),
+-    }
+-    kb = InlineKeyboardMarkup([
+-        [InlineKeyboardButton("✅ Accept & index",
+-                              callback_data=f"idx:reqaccept:{token}")],
+-        [InlineKeyboardButton("❌ Reject",
+-                              callback_data=f"idx:reqreject:{token}")],
+-    ])
+-    try:
+-        await context.bot.send_message(
+-            settings.log_channel_id,
+-            f"#IndexRequest\n\n"
+-            f"By: {_html.escape(_REQ_INDEX[token]['from_name'])} "
+-            f"(<code>{uid}</code>)\n"
+-            f"📌 {_html.escape(info['title'])}\n"
+-            f"🆔 <code>{_html.escape(ref)}</code>\n"
+-            f"🔢 Last message: <b>{info['last_msg_id']}</b>",
+-            parse_mode="HTML", reply_markup=kb)
+-    except Exception as exc:  # noqa: BLE001
+-        _REQ_INDEX.pop(token, None)
+-        await msg.reply_text(
+-            f"❌ Couldn't forward the request to moderators: "
+-            f"<code>{_html.escape(str(exc))}</code>", parse_mode="HTML")
++            f"<code>{_html.escape(str(exc)[:200])}</code>\n"
++            "Make sure the bot is a member of the channel.",
++            parse_mode="HTML")
+         return
+-    await msg.reply_text(
+-        "✅ <b>Request sent!</b>\nModerators will review it — "
+-        "I'll notify you of the decision.", parse_mode="HTML")
+-
+ 
+-def _agg_text(agg: dict, started: float = 0.0,
+-              cfg: dict | None = None, workers: int = 0) -> str:
+-    """Live progress card for a parallel backfill run (DB-aggregated)."""
+-    lines = ["📥 <b>Backfill running…</b>"]
+-    if agg.get("titles"):
+-        shown = ", ".join(agg["titles"][:3])
+-        more = "…" if len(agg["titles"]) > 3 else ""
+-        lines.append(f"📌 {_html.escape(shown)}{more}")
+-    if workers:
+-        lines.append(f"👷 Workers: <b>{workers}</b>")
+-    lines.append("")
+-    if cfg and cfg.get("limit"):
+-        pct = min(1.0, agg["saved"] / cfg["limit"])
+-        lines.append(f"{_bar(pct)} <b>{pct * 100:.0f}%</b>")
+-        lines.append("")
+-    saved_label = "📨 Forwarded" if agg.get("mode") == "forward" else "💾 Saved"
+-    lines.append(f"{saved_label}: <b>{agg['saved']}</b>")
+-    lines.append(f"⏭️ Skipped: <b>{agg['skipped']}</b>")
+-    if agg.get("dupes"):
+-        lines.append(f"♻️ Already indexed: <b>{agg['dupes']}</b>")
+-    lines.append(f"❌ Errors: <b>{agg['errors']}</b>")
+-    if agg.get("last_error"):
+-        lines.append(f"⚠️ <code>{_html.escape(agg['last_error'][:180])}</code>")
+-    finished = agg.get("done", 0) + agg.get("cancelled", 0) + agg.get("error", 0)
+-    lines.append(f"🧩 Jobs: <b>{finished}/{agg.get('total', 0)}</b> done")
+-    if started:
+-        el = _time.monotonic() - started
+-        rate = agg["saved"] / (el / 60) if el > 5 else 0
+-        lines.append(f"\n⏱ {int(el // 60)}m {int(el % 60):02d}s"
+-                     f" • ⚡ {rate:.0f}/min")
+-    return "\n".join(lines)
+-
+-
+-async def _begin_backfill(context: ContextTypes.DEFAULT_TYPE, token: str,
+-                          channels: list, cfg: dict, chat_id: int,
+-                          edit_msg_id: int | None = None) -> None:
+-    """Create chunked jobs and launch the parallel backfill engine.
++    await wait.edit_text(
++        f"📥 <b>Indexing:</b> {_html.escape(info['title'])}\n"
++        f"🔢 Last message: <b>{info['last_msg_id']}</b>\n\n"
++        f"<i>Forwarding media to dump channel…</i>\n"
++        f"<i>/index cancel — to stop</i>",
++        parse_mode="HTML")
+ 
+-    Shared by the /index panel flow and accepted moderator requests.
+-    Progress is shown by editing one status message (existing or new).
+-    """
+-    from app.services import mtproto_index
+-    mode = mtproto_index.backfill_mode()
+-    # direct mode packs file_ids from history — no bot username needed.
+-    # forward mode needs the bot's username to forward files to it.
+-    bot_username = ""
+-    if mode == "forward":
++    async def _progress(s: dict):
+         try:
+-            me = await context.bot.get_me()
+-            bot_username = "@" + (me.username or "")
+-        except Exception:  # noqa: BLE001
+-            bot_username = ""
+-        if not bot_username or bot_username == "@":
+-            await context.bot.send_message(
+-                chat_id,
+-                "❌ <i>Bot has no username — set one in BotFather.</i>",
++            await wait.edit_text(
++                f"📥 <b>Indexing:</b> {_html.escape(s.get('title', info['title']))}\n"
++                f"🔍 Scanned: <b>{s.get('scanned', 0)}</b> | "
++                f"📤 Forwarded: <b>{s.get('forwarded', 0)}</b> | "
++                f"⚠️ Errors: <b>{s.get('errors', 0)}</b>",
+                 parse_mode="HTML")
+-            return
+-    kb = InlineKeyboardMarkup([[
+-        InlineKeyboardButton("🛑 Cancel", callback_data=f"idx:cancel:{token}")]])
+-    cancel_event = asyncio.Event()
+-    if edit_msg_id:
+-        await context.bot.edit_message_text(
+-            "📥 <b>Indexing… starting</b>", chat_id=chat_id,
+-            message_id=edit_msg_id, parse_mode="HTML", reply_markup=kb)
+-        status_id = edit_msg_id
+-    else:
+-        status = await context.bot.send_message(
+-            chat_id, "📥 <b>Indexing… starting</b>",
+-            parse_mode="HTML", reply_markup=kb)
+-        status_id = status.message_id
+-    run = {"event": cancel_event, "chat_id": chat_id,
+-           "msg_id": status_id, "start": _time.monotonic(),
+-           "token": token}
+-    _INDEX_RUNS[token] = run
+-
+-    try:
+-        created = await mtproto_index.create_jobs(
+-            token, channels, skip=cfg["skip"],
+-            from_id=cfg["from_id"], to_id=cfg["to_id"])
+-    except Exception as exc:  # noqa: BLE001
+-        _INDEX_RUNS.pop(token, None)
+-        try:
+-            await context.bot.edit_message_text(
+-                f"❌ <b>Couldn't start:</b> "
+-                f"<code>{_html.escape(str(exc))}</code>",
+-                chat_id=chat_id, message_id=status_id, parse_mode="HTML")
+-        except Exception:  # noqa: BLE001
+-            pass
+-        return
+-    if not created["jobs"]:
+-        _INDEX_RUNS.pop(token, None)
+-        try:
+-            await context.bot.edit_message_text(
+-                "ℹ️ <i>Nothing to index — channels are empty or out of range.</i>",
+-                chat_id=chat_id, message_id=status_id, parse_mode="HTML")
+         except Exception:  # noqa: BLE001
+             pass
+-        return
+-    workers = mtproto_index.session_count()
+ 
+-    async def push(agg: dict) -> None:
+-        try:
+-            await context.bot.edit_message_text(
+-                _agg_text(agg, started=run["start"], cfg=cfg,
+-                          workers=workers),
+-                chat_id=chat_id, message_id=status_id, parse_mode="HTML",
+-                reply_markup=kb)
+-        except Exception:  # noqa: BLE001
+-            pass
++    res = await idx.start_run(raw_ref, progress_cb=_progress)
++    if res.get("error") == "already_running":
++        await wait.edit_text("⚠️ An index run is already active.")
++        return
+ 
+-    async def runner() -> None:
++    # Wait for completion and show final stats.
++    run = idx._current_run
++    if run:
+         try:
+-            totals = await mtproto_index.run_backfill(
+-                token, bot_username, cancel_event, progress_cb=push,
+-                limit=cfg["limit"] or 0)
+-        except Exception as exc:  # noqa: BLE001
+-            totals = {"fatal": str(exc), "saved": 0}
+-        _INDEX_RUNS.pop(token, None)
+-        if totals.get("fatal"):
+-            tail = (f"❌ <b>Failed:</b> "
+-                    f"<code>{_html.escape(totals['fatal'])}</code>")
+-        elif totals.get("cancelled"):
+-            tail = "🛑 <i>Cancelled.</i>"
+-        elif totals.get("limit_hit"):
+-            tail = "✅ <b>Done — file limit reached.</b>"
+-        else:
+-            tail = "✅ <b>Done.</b>"
+-        final = (f"📥 <b>Backfill finished</b> ({totals.get('mode', '?')} mode)\n\n"
+-                 f"{'📨 Forwarded' if totals.get('mode') == 'forward' else '💾 Saved'}: "
+-                 f"<b>{totals.get('saved', 0)}</b>\n"
+-                 f"⏭️ Skipped: <b>{totals.get('skipped', 0)}</b>\n"
+-                 f"♻️ Already indexed: <b>{totals.get('dupes', 0)}</b>\n"
+-                 f"❌ Errors: <b>{totals.get('errors', 0)}</b>\n"
+-                 f"👷 Workers: <b>{totals.get('workers', workers)}</b>\n\n"
+-                 f"{tail}")
+-        if totals.get("errors"):
+-            try:
+-                errs = await mtproto_index.job_errors(token)
+-            except Exception:  # noqa: BLE001
+-                errs = []
+-            if errs:
+-                detail = "\n".join(
+-                    f"• {_html.escape((e['title'] or '?')[:40])}: "
+-                    f"<code>{_html.escape((e['error'] or '')[:180])}</code>"
+-                    for e in errs)
+-                final += f"\n\n⚠️ <b>What failed:</b>\n{detail}"
+-        final += "\n\n<i>Send /index for the new total.</i>"
+-        try:
+-            await context.bot.edit_message_text(
+-                final, chat_id=chat_id, message_id=status_id,
+-                parse_mode="HTML")
+-        except Exception:  # noqa: BLE001
++            await run["task"]
++        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+             pass
+-
+-    run["task"] = asyncio.create_task(runner())
++    st = (idx._current_run or {}).get("stats", {}) if idx._current_run else {}
++    # _current_run may be cleared; use the last progress stats.
++    final = getattr(_progress, "_last", None) or st
++    try:
++        await wait.edit_text(
++            f"✅ <b>Index done:</b> {_html.escape(info['title'])}\n"
++            f"🔍 Scanned: <b>{final.get('scanned', 0)}</b>\n"
++            f"📤 Forwarded: <b>{final.get('forwarded', 0)}</b>\n"
++            f"⚠️ Errors: <b>{final.get('errors', 0)}</b>\n\n"
++            f"<i>Files are being indexed from the dump channel…</i>",
++            parse_mode="HTML")
++    except Exception:  # noqa: BLE001
++        pass
+ 
+ 
+-async def _launch_index_run(query, context: ContextTypes.DEFAULT_TYPE,
+-                            token: str, channels: list, cfg: dict) -> None:
+-    """Panel 'go' entry point — edits the confirmation message in place."""
+-    await _begin_backfill(context, token, channels, cfg,
+-                          query.message.chat_id,
+-                          edit_msg_id=query.message.message_id)
++async def _on_idx_cancel_cmd(update: Update,
++                             context: ContextTypes.DEFAULT_TYPE) -> None:
++    """Legacy /cancel hook — cancels an active index run."""
++    from app.services import indexer as idx
++    user = update.effective_user
++    if not is_admin(user.id if user else 0):
++        return
++    stopped = await idx.cancel_run()
++    await update.effective_message.reply_text(
++        "🛑 Indexing cancelled." if stopped else "No active index run.")
+ 
+ 
+ def register(application: Application) -> None:
+-    application.add_handler(MessageHandler(
+-        filters.UpdateType.CHANNEL_POST & filters.ATTACHMENT,
+-        on_channel_post,
+-    ))
++    from telegram.ext import CommandHandler, MessageHandler, filters
+     application.add_handler(CommandHandler("index", index_command))
+     application.add_handler(CommandHandler("cancel", _on_idx_cancel_cmd))
+-    application.add_handler(CallbackQueryHandler(_on_index_callback,
+-                                                pattern=r"^idx:"))
+-    application.add_handler(MessageHandler(
+-        filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
+-        & _AwaitingFilter(),
+-        _on_idx_text_input,
+-    ))
++    # Channel posts -> auto-index
+     application.add_handler(MessageHandler(
+-        filters.ChatType.PRIVATE & ~filters.COMMAND & _ReqAwaitFilter(),
+-        _on_req_input,
+-    ))
++        filters.UpdateType.CHANNEL_POST, on_channel_post))
++    # Admin PM media -> index
+     application.add_handler(MessageHandler(
+-        filters.ChatType.PRIVATE & filters.ATTACHMENT,
+-        on_admin_pm_media,
+-    ))
++        filters.ChatType.PRIVATE & (filters.Document.ALL
++                                    | filters.VIDEO | filters.AUDIO),
++        on_admin_pm_media))
+diff --git a/app/services/indexer.py b/app/services/indexer.py
+new file mode 100644
+index 0000000..dd0aa32
+--- /dev/null
++++ b/app/services/indexer.py
+@@ -0,0 +1,270 @@
++"""Fresh channel indexer — simple, fast, no bugs.
++
++How it works (the proven path):
++1. Pyrogram (bot token, no user session) walks the source channel's history.
++2. Media messages are bulk-forwarded (100 per API call) to INDEX_CHANNEL.
++3. The bot's `on_channel_post` auto-index handler saves each file with a
++   native Bot API file_id — guaranteed deliverable via Bot API.
++
++No job table, no Telethon, no manual file_id packing, no resume complexity.
++If the run is interrupted, just run /index again (dedupe by file_id skips
++already-indexed files).
++
++Requires:
++- INDEXER_BOT_MODE=true (bot logs in via MTProto itself)
++- INDEX_CHANNELS set (dump channel where the bot is admin)
++- Bot must be a member of the source channel
++"""
++from __future__ import annotations
++
++import asyncio
++import logging
++
++log = logging.getLogger(__name__)
++
++_client = None
++_client_lock = asyncio.Lock()
++
++# One run at a time per process.
++_current_run: dict | None = None
++_run_lock = asyncio.Lock()
++
++
++async def get_client():
++    """Pyrogram bot client singleton (in-memory session)."""
++    global _client
++    if _client is None:
++        async with _client_lock:
++            if _client is None:
++                from pyrogram import Client
++                from app.config import settings
++                if not (settings.BOT_TOKEN and settings.TG_API_ID
++                        and settings.TG_API_HASH):
++                    raise RuntimeError(
++                        "indexer not configured: set BOT_TOKEN + TG_API_ID + "
++                        "TG_API_HASH and INDEXER_BOT_MODE=true")
++                _client = Client(
++                    "moovidex_indexer",
++                    api_id=int(settings.TG_API_ID),
++                    api_hash=settings.TG_API_HASH,
++                    bot_token=settings.BOT_TOKEN,
++                    in_memory=True,
++                )
++                await _client.start()
++                me = await _client.get_me()
++                log.info("indexer logged in as @%s (%s)", me.username, me.id)
++    return _client
++
++
++def indexer_configured() -> bool:
++    from app.config import settings
++    return bool(settings.INDEXER_BOT_MODE and settings.BOT_TOKEN
++                and settings.TG_API_ID and settings.TG_API_HASH
++                and settings.index_channels)
++
++
++def parse_channel_ref(raw: str) -> str:
++    """Normalize a channel ref (username, t.me link, -100 id, invite link)."""
++    s = (raw or "").strip()
++    if s.startswith("https://"):
++        s = s.split("https://", 1)[1]
++    for prefix in ("t.me/", "telegram.me/", "telegram.dog/"):
++        if s.startswith(prefix):
++            s = s[len(prefix):]
++    # Private invite links: t.me/+xxxx or t.me/joinchat/xxxx — keep as-is,
++    # Pyrogram's get_chat() can resolve them if the bot can access.
++    if s.startswith("+") or s.startswith("joinchat/"):
++        return "https://t.me/" + s
++    if s.startswith("c/"):
++        # t.me/c/<internal_id>/<msg> -> -100<internal_id>
++        parts = s[2:].split("/")
++        if parts and parts[0].isdigit():
++            return "-100" + parts[0]
++    return s
++
++
++async def resolve_channel(ref: str) -> dict:
++    """Resolve ref -> {ref, chat_id, title, last_msg_id}. Raises on error."""
++    client = await get_client()
++    ref = parse_channel_ref(ref)
++    try:
++        chat = await client.get_chat(ref)
++    except Exception:
++        chat = await client.get_chat(int(ref))
++    last = 0
++    async for m in client.get_chat_history(chat.id, limit=1):
++        last = m.id
++        break
++    return {
++        "ref": ref,
++        "chat_id": chat.id,
++        "title": getattr(chat, "title", None) or ref,
++        "last_msg_id": last,
++    }
++
++
++def _has_media(msg) -> bool:
++    return bool(msg.document or msg.video or msg.audio or msg.photo
++                or msg.animation or msg.voice or msg.video_note)
++
++
++async def index_channel(ref: str, progress_cb=None,
++                        cancel_event: asyncio.Event | None = None,
++                        skip: int = 0, min_id: int = 0,
++                        max_id: int = 0) -> dict:
++    """Walk channel history newest->oldest, bulk-forward media to dump.
++
++    progress_cb(stats) is called after each batch. stats:
++    {scanned, queued, forwarded, errors, done}
++    """
++    from pyrogram.errors import FloodWait
++    from app.config import settings
++
++    client = await get_client()
++    info = await resolve_channel(ref)
++    dump_id = settings.index_channels[0]
++
++    stats = {"scanned": 0, "queued": 0, "forwarded": 0, "errors": 0,
++             "done": False, "title": info["title"]}
++    cancel = cancel_event or asyncio.Event()
++    batch: list[int] = []
++    skip_left = max(0, skip)
++    offset_id = max_id or 0
++
++    async def flush():
++        if not batch:
++            return
++        try:
++            await client.forward_messages(
++                chat_id=dump_id,
++                from_chat_id=info["chat_id"],
++                message_ids=batch,
++            )
++            stats["forwarded"] += len(batch)
++        except FloodWait as e:
++            log.warning("index FloodWait %ss, sleeping", e.value)
++            await asyncio.sleep(e.value + 5)
++            # retry once
++            try:
++                await client.forward_messages(
++                    chat_id=dump_id,
++                    from_chat_id=info["chat_id"],
++                    message_ids=batch,
++                )
++                stats["forwarded"] += len(batch)
++            except Exception as e2:  # noqa: BLE001
++                log.warning("index retry failed: %s", e2)
++                stats["errors"] += len(batch)
++        except Exception as e:  # noqa: BLE001
++            log.warning("index forward batch failed: %s", e)
++            stats["errors"] += len(batch)
++        batch.clear()
++        if progress_cb:
++            try:
++                await progress_cb(dict(stats))
++            except Exception:  # noqa: BLE001
++                pass
++
++    while not cancel.is_set():
++        try:
++            msgs = [m async for m in client.get_chat_history(
++                info["chat_id"], limit=200,
++                offset_id=offset_id or None)]
++        except FloodWait as e:
++            log.warning("index history FloodWait %ss", e.value)
++            await asyncio.sleep(e.value + 5)
++            continue
++        except Exception as e:  # noqa: BLE001
++            log.exception("index history error: %s", e)
++            stats["errors"] += 1
++            break
++        if not msgs:
++            break
++        for m in msgs:
++            stats["scanned"] += 1
++            offset_id = m.id
++            if min_id and m.id < min_id:
++                await flush()
++                stats["done"] = True
++                if progress_cb:
++                    await progress_cb(dict(stats))
++                return stats
++            if cancel.is_set():
++                break
++            if not _has_media(m):
++                continue
++            if skip_left > 0:
++                skip_left -= 1
++                continue
++            batch.append(m.id)
++            stats["queued"] += 1
++            if len(batch) >= 100:
++                await flush()
++        await flush()
++        await asyncio.sleep(0.2)
++
++    await flush()
++    stats["done"] = True
++    if progress_cb:
++        try:
++            await progress_cb(dict(stats))
++        except Exception:  # noqa: BLE001
++            pass
++    return stats
++
++
++async def start_run(ref: str, progress_cb=None) -> dict:
++    """Start an index run if none is active. Returns run dict or error."""
++    global _current_run
++    async with _run_lock:
++        if _current_run and not _current_run["task"].done():
++            return {"error": "already_running",
++                    "title": _current_run.get("title", "")}
++        cancel = asyncio.Event()
++        run = {"ref": ref, "cancel": cancel, "task": None,
++               "title": ref, "stats": {}}
++
++        async def _runner():
++            try:
++                async def _cb(s):
++                    run["stats"] = s
++                    run["title"] = s.get("title", ref)
++                    if progress_cb:
++                        await progress_cb(s)
++                await index_channel(ref, progress_cb=_cb,
++                                    cancel_event=cancel)
++            except asyncio.CancelledError:
++                raise
++            except Exception as e:  # noqa: BLE001
++                log.exception("index run crashed: %s", e)
++                run["stats"] = {"error": str(e)[:200], "done": True}
++
++        run["task"] = asyncio.create_task(_runner())
++        _current_run = run
++        return {"started": True, "ref": ref}
++
++
++async def cancel_run() -> bool:
++    """Cancel the active run. Returns True if one was running."""
++    global _current_run
++    async with _run_lock:
++        if _current_run and not _current_run["task"].done():
++            _current_run["cancel"].set()
++            _current_run["task"].cancel()
++            try:
++                await _current_run["task"]
++            except (asyncio.CancelledError, Exception):  # noqa: BLE001
++                pass
++            _current_run = None
++            return True
++        _current_run = None
++        return False
++
++
++def run_status() -> dict | None:
++    """Current run info or None."""
++    if _current_run and not _current_run["task"].done():
++        return {"ref": _current_run["ref"],
++                "title": _current_run.get("title", ""),
++                "stats": _current_run.get("stats", {})}
++    return None
+diff --git a/app/services/mtproto_index.py b/app/services/mtproto_index.py
+deleted file mode 100644
+index 32d227e..0000000
+--- a/app/services/mtproto_index.py
++++ /dev/null
+@@ -1,1063 +0,0 @@
+-"""Parallel multi-account MTProto backfill engine.
+-
+-Two modes (BACKFILL_MODE):
+-
+-- **forward** (proven fallback): forward every media message to the bot in
+-  bulk batches (BACKFILL_BATCH per API call), which indexes each received
+-  file with a Bot-API-issued file_id: ~15-30 files/sec per account.
+-  The file_ids are guaranteed Bot-API-issued, so delivery always works.
+-  Use this with user sessions (TG_SESSIONS) when the bot can't join the
+-  channel directly.
+-
+-- **direct** (default, fastest): walk history and save each media file's
+-  Bot API file_id straight into Postgres (~500-1000 files/sec).
+-  REQUIRES INDEXER_BOT_MODE=true — the indexer logs in as the bot itself
+-  via MTProto using **Pyrogram** (same library Tech VJ uses). Pyrogram's
+-  ``message.document.file_id`` is ALREADY the correct Bot API file_id —
+-  no manual packing, no format guessing. This is exactly how Tech VJ-style
+-  bots do it: bot token only, no user session string. NOTE: user sessions
+-  (TG_SESSIONS) do NOT work for direct mode.
+-
+-Shared safety: chunked resumable jobs (backfill_jobs table, SKIP LOCKED
+-claiming, offset_id checkpointed as the worker walks), FloodWait backoff
+-(sleep e.seconds+5, 10-min cooldown after 5 consecutive), graceful cancel.
+-
+-Security model: API_ID/API_HASH/sessions come from env vars only. Indexer
+-accounts should be DEDICATED spare accounts.
+-"""
+-from __future__ import annotations
+-
+-import asyncio
+-import logging
+-import random
+-import re
+-
+-log = logging.getLogger(__name__)
+-
+-_clients: list = []
+-_clients_lock = asyncio.Lock()
+-_pyro_client = None
+-_pyro_lock = asyncio.Lock()
+-
+-_LINK_RE = re.compile(
+-    r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$"
+-)
+-
+-_CHECKPOINT_EVERY = 25
+-_FW_COOLDOWN_AFTER = 5
+-_FW_COOLDOWN_SECS = 600
+-_DIRECT_BATCH = 500
+-
+-
+-def indexer_configured() -> bool:
+-    from app.config import settings
+-    if settings.INDEXER_BOT_MODE:
+-        return bool(settings.BOT_TOKEN and settings.TG_API_ID
+-                    and settings.TG_API_HASH)
+-    return bool(settings.tg_sessions and settings.TG_API_ID
+-                and settings.TG_API_HASH)
+-
+-
+-def backfill_mode() -> str:
+-    from app.config import settings
+-    mode = (settings.BACKFILL_MODE or "direct").strip().lower()
+-    return mode if mode in ("direct", "forward") else "direct"
+-
+-
+-def session_count() -> int:
+-    from app.config import settings
+-    return len(settings.tg_sessions)
+-
+-
+-def parse_channel_ref(text: str) -> tuple[str, int]:
+-    """Accept @username, t.me links (incl. t.me/c/<id>/<msg>), or -100 ids.
+-
+-    Returns (chat_ref, last_msg_id_hint). last_msg_id_hint is 0 when unknown.
+-    """
+-    text = text.strip()
+-    m = _LINK_RE.match(text)
+-    if m:
+-        chat_id, msg_id = m.group(4), int(m.group(5))
+-        if chat_id.isnumeric():
+-            chat_id = "-100" + chat_id
+-        return chat_id, msg_id
+-    if text.startswith("@") or text.startswith("-100") or text.lstrip("-").isdigit():
+-        return text, 0
+-    return "@" + text, 0
+-
+-
+-def _entity_ref(ref: str):
+-    """Normalize a channel ref for Telethon's get_entity.
+-
+-    "-100…" strings (the only way to address a private channel) are turned
+-    into PeerChannel — get_entity doesn't reliably parse them as strings.
+-    """
+-    from telethon.tl.types import PeerChannel
+-    s = ref.strip()
+-    digits = s[4:] if s.startswith("-100") else s
+-    if digits and digits.lstrip("-").isdigit():
+-        return PeerChannel(int(digits))
+-    return ref
+-
+-
+-async def get_clients() -> list:
+-    """Lazily build one Telethon client per configured user session.
+-
+-    Bot mode (INDEXER_BOT_MODE) uses Pyrogram instead — see
+-    get_pyro_client(). This is only for user sessions (forward mode).
+-    """
+-    global _clients
+-    if not indexer_configured():
+-        raise RuntimeError(
+-            "indexer not configured (set INDEXER_BOT_MODE=true or "
+-            "TG_SESSION/TG_SESSIONS + TG_API_ID/TG_API_HASH)")
+-    if not _clients:
+-        async with _clients_lock:
+-            if not _clients:
+-                from telethon import TelegramClient
+-                from telethon.sessions import StringSession
+-                from app.config import settings
+-                for sess in settings.tg_sessions:
+-                    _clients.append(TelegramClient(
+-                        StringSession(sess),
+-                        int(settings.TG_API_ID),
+-                        settings.TG_API_HASH,
+-                    ))
+-    for c in _clients:
+-        if not c.is_connected():
+-            await c.connect()
+-    return _clients
+-
+-
+-async def get_pyro_client():
+-    """Pyrogram bot client for INDEXER_BOT_MODE.
+-
+-    Logs in as the bot itself (bot token, no session string).
+-    Pyrogram's message.file_id is already the correct Bot API file_id —
+-    exactly like Tech VJ.
+-    """
+-    global _pyro_client
+-    if _pyro_client is None:
+-        async with _pyro_lock:
+-            if _pyro_client is None:
+-                from pyrogram import Client
+-                from app.config import settings
+-                _pyro_client = Client(
+-                    "moovidex_indexer",
+-                    api_id=int(settings.TG_API_ID),
+-                    api_hash=settings.TG_API_HASH,
+-                    bot_token=settings.BOT_TOKEN,
+-                    in_memory=True,
+-                )
+-                await _pyro_client.start()
+-                me = await _pyro_client.get_me()
+-                log.info("pyrogram indexer logged in as @%s (%s)",
+-                         me.username, me.id)
+-    return _pyro_client
+-
+-
+-async def resolve_channel(ref: str, client=None) -> dict:
+-    """Resolve a channel ref -> title/chat_id/last message id. Raises on error."""
+-    from app.config import settings
+-    # Bot mode: use Pyrogram (same as the walker).
+-    if settings.INDEXER_BOT_MODE and client is None:
+-        pyro = await get_pyro_client()
+-        try:
+-            chat = await pyro.get_chat(ref)
+-        except Exception:  # noqa: BLE001
+-            # ref might be a numeric id string
+-            chat = await pyro.get_chat(int(ref))
+-        last = 0
+-        async for m in pyro.get_chat_history(chat.id, limit=1):
+-            last = m.id
+-            break
+-        return {
+-            "ref": ref,
+-            "chat_id": chat.id,
+-            "title": getattr(chat, "title", None) or ref,
+-            "last_msg_id": last,
+-        }
+-    client = client or (await get_clients())[0]
+-    if not client.is_connected():
+-        await client.connect()
+-    entity = await client.get_entity(_entity_ref(ref))
+-    last = 0
+-    async for m in client.iter_messages(entity, limit=1):
+-        last = m.id
+-        break
+-    return {
+-        "ref": ref,
+-        "chat_id": getattr(entity, "id", None),
+-        "title": getattr(entity, "title", None) or ref,
+-        "last_msg_id": last,
+-    }
+-
+-
+-async def create_jobs(run_token: str, channel_refs: list[str], *,
+-                      skip: int = 0, from_id: int = 0, to_id: int = 0) -> dict:
+-    """Split channels into chunked jobs and store them as pending.
+-
+-    skip applies to the newest chunk of each channel only.
+-    Returns {"jobs": n, "channels": [{"ref","title","last_msg_id"}]}.
+-    """
+-    from app.config import settings
+-    from app.db import get_session_factory
+-    from app.models import BackfillJob
+-
+-    # Bot mode: resolve_channel uses Pyrogram internally (client=None).
+-    if settings.INDEXER_BOT_MODE:
+-        client = None
+-    else:
+-        client = (await get_clients())[0]
+-    factory = get_session_factory(settings.DATABASE_URL)
+-    chunk = max(50000, settings.BACKFILL_CHUNK)
+-    jobs = 0
+-    channels = []
+-    async with factory() as session:
+-        for ref in channel_refs:
+-            info = await resolve_channel(ref, client)
+-            last = info["last_msg_id"]
+-            hi = to_id or last
+-            lo = from_id or 1
+-            channels.append({"ref": ref, "title": info["title"],
+-                             "last_msg_id": last})
+-            if hi < lo or last <= 0:
+-                continue
+-            cur_hi = hi
+-            first = True
+-            while cur_hi >= lo:
+-                cur_lo = max(lo, cur_hi - chunk + 1)
+-                session.add(BackfillJob(
+-                    run_token=run_token,
+-                    channel_ref=ref,
+-                    channel_id=info["chat_id"],
+-                    channel_title=info["title"],
+-                    min_id=cur_lo,
+-                    max_id=cur_hi,
+-                    skip=skip if first else 0,
+-                    status="pending",
+-                    offset_id=cur_hi,
+-                    stats={},
+-                ))
+-                first = False
+-                jobs += 1
+-                cur_hi = cur_lo - 1
+-        await session.commit()
+-    return {"jobs": jobs, "channels": channels}
+-
+-
+-async def _claim_job(factory, run_token: str, worker: int):
+-    """Claim one pending job (SKIP LOCKED — no double work)."""
+-    from sqlalchemy import select
+-    from app.models import BackfillJob
+-    async with factory() as session:
+-        job = (await session.execute(
+-            select(BackfillJob)
+-            .where(BackfillJob.run_token == run_token,
+-                   BackfillJob.status == "pending")
+-            .order_by(BackfillJob.id)
+-            .limit(1)
+-            .with_for_update(skip_locked=True)
+-        )).scalar_one_or_none()
+-        if job is None:
+-            return None
+-        job.status = "running"
+-        job.worker = worker
+-        await session.commit()
+-        await session.refresh(job)
+-        return {"id": job.id, "channel_ref": job.channel_ref,
+-                "channel_id": job.channel_id, "min_id": job.min_id,
+-                "max_id": job.max_id, "skip": job.skip,
+-                "offset_id": job.offset_id}
+-
+-
+-async def _save_job(factory, job_id: int, **fields) -> None:
+-    from app.models import BackfillJob
+-    async with factory() as session:
+-        job = await session.get(BackfillJob, job_id)
+-        if job is None:
+-            return
+-        for k, v in fields.items():
+-            setattr(job, k, v)
+-        await session.commit()
+-
+-
+-async def _already_indexed(factory, channel_id: int,
+-                           msg_ids: list[int]) -> set[int]:
+-    """Which source message ids are already in the DB (pre-filter)."""
+-    if not msg_ids or not channel_id:
+-        return set()
+-    from sqlalchemy import select
+-    from app.models import File
+-    async with factory() as session:
+-        rows = (await session.execute(
+-            select(File.source_message_id)
+-            .where(File.source_channel_id == channel_id,
+-                   File.source_message_id.in_(msg_ids))
+-        )).all()
+-    return {r[0] for r in rows if r[0]}
+-
+-
+-# ------------------------- direct-save helpers -------------------------
+-
+-def _doc_file_type(doc) -> int:
+-    """Bot API file type id from a Telethon Document's attributes."""
+-    from telethon.tl import types
+-    ftype = 5  # generic document
+-    for attr in doc.attributes:
+-        if isinstance(attr, types.DocumentAttributeAudio):
+-            ftype = 3 if attr.voice else 9
+-        elif isinstance(attr, types.DocumentAttributeVideo):
+-            ftype = 13 if attr.round_message else 4
+-        elif isinstance(attr, types.DocumentAttributeSticker):
+-            ftype = 8
+-        elif isinstance(attr, types.DocumentAttributeAnimated):
+-            ftype = 10
+-        else:
+-            continue
+-        break
+-    return ftype
+-
+-
+-def _doc_file_name(doc) -> str | None:
+-    from telethon.tl import types
+-    for attr in doc.attributes:
+-        if isinstance(attr, types.DocumentAttributeFilename):
+-            return attr.file_name
+-    return None
+-
+-
+-def _pack_message_file(m) -> str | None:
+-    """Bot API file_id for a Telethon message's document, or None.
+-
+-    Uses the verified Bot API layout with the fresh file_reference from
+-    getHistory (see app/services/fileid_conv.pack_bot_file_id_typed).
+-    None = no usable id (no file_reference on the document).
+-    """
+-    from app.services.fileid_conv import pack_bot_file_id_typed
+-    doc = m.document
+-    if doc is None:
+-        return None
+-    ref = getattr(doc, "file_reference", None)
+-    if not ref:
+-        return None
+-    return pack_bot_file_id_typed(
+-        _doc_file_type(doc), doc.dc_id, doc.id, doc.access_hash, bytes(ref))
+-
+-
+-def telethon_media_meta(doc) -> dict:
+-    """Width/height/duration/streaming flag from a Telethon Document.
+-
+-    All of this ships with the file metadata — no download needed.
+-    """
+-    from telethon.tl import types
+-    meta = {"width": None, "height": None, "duration": None,
+-            "supports_streaming": None}
+-    for attr in doc.attributes:
+-        if isinstance(attr, types.DocumentAttributeVideo):
+-            meta["width"] = attr.w or None
+-            meta["height"] = attr.h or None
+-            meta["duration"] = attr.duration or None
+-            meta["supports_streaming"] = bool(
+-                getattr(attr, "supports_streaming", False))
+-        elif isinstance(attr, types.DocumentAttributeAudio):
+-            if meta["duration"] is None:
+-                meta["duration"] = attr.duration or None
+-    return meta
+-
+-
+-async def _bulk_save_files(factory, rows: list[dict]) -> tuple[int, int]:
+-    """Bulk-insert file rows; ON CONFLICT DO NOTHING on file_id.
+-
+-    Returns (saved, duplicates). The files.search_vector trigger keeps
+-    full-text search fresh automatically.
+-    """
+-    if not rows:
+-        return 0, 0
+-    from sqlalchemy.dialects.postgresql import insert as pg_insert
+-    from app.models import File
+-    async with factory() as session:
+-        stmt = (pg_insert(File).values(rows)
+-                .on_conflict_do_nothing(index_elements=["file_id"])
+-                .returning(File.id))
+-        res = await session.execute(stmt)
+-        saved = len(res.fetchall())
+-        await session.commit()
+-    return saved, len(rows) - saved
+-
+-
+-async def _walk_job_direct(client, factory, job: dict, ctx: dict) -> dict:
+-    """Walk one job newest->oldest, packing file_ids and bulk-saving.
+-
+-    No forwarding, no per-file delay: throughput is bounded by getHistory
+-    rate (~500-1000 msgs/sec) and bulk-insert speed.
+-    """
+-    from telethon.errors import FloodWaitError
+-    from app.services.textutil import detect_quality_language, title_key
+-
+-    stats = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0, "errors": 0}
+-    channel = await client.get_entity(_entity_ref(job["channel_ref"]))
+-    src_id = job["channel_id"]
+-    offset_id = job["offset_id"] or job["max_id"] or 0
+-    skip_left = max(0, job["skip"])
+-    rows: list[dict] = []
+-    fw_streak = 0
+-
+-    async def flush() -> None:
+-        if not rows:
+-            return
+-        try:
+-            saved, dupes = await _bulk_save_files(factory, rows)
+-            stats["saved"] += saved
+-            stats["dupes"] += dupes
+-        except Exception as e:  # noqa: BLE001
+-            stats["errors"] += len(rows)
+-            log.warning("backfill bulk save failed (%d rows): %s",
+-                        len(rows), e)
+-        rows.clear()
+-        await _save_job(factory, job["id"], offset_id=offset_id,
+-                        stats=dict(stats))
+-
+-    while True:
+-        if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-            break
+-        try:
+-            batch = [m async for m in client.iter_messages(
+-                channel, limit=200, offset_id=offset_id or None,
+-                max_id=job["max_id"] or None)]
+-        except FloodWaitError as e:
+-            fw_streak += 1
+-            wait = e.seconds + 5
+-            log.warning("backfill iterate FloodWait %ss (job %s), sleeping %ss",
+-                        e.seconds, job["id"], wait)
+-            await flush()
+-            await asyncio.sleep(wait)
+-            if fw_streak >= _FW_COOLDOWN_AFTER:
+-                log.warning("backfill job %s: %d consecutive FloodWaits, "
+-                            "cooling down %ss", job["id"], fw_streak,
+-                            _FW_COOLDOWN_SECS)
+-                await asyncio.sleep(_FW_COOLDOWN_SECS)
+-                fw_streak = 0
+-            continue
+-        except Exception as e:  # noqa: BLE001
+-            log.exception("backfill iterate error (job %s): %s", job["id"], e)
+-            stats["errors"] += 1
+-            await flush()
+-            await _save_job(factory, job["id"], offset_id=offset_id,
+-                            stats=dict(stats), status="error",
+-                            error=str(e)[:500])
+-            return stats
+-        if not batch:
+-            break  # reached the beginning of the range
+-        fw_streak = 0
+-        done = False
+-        for m in batch:
+-            stats["scanned"] += 1
+-            offset_id = m.id
+-            if job["min_id"] and m.id < job["min_id"]:
+-                done = True
+-                break
+-            if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-                break
+-            doc = m.document
+-            if doc is None:
+-                stats["skipped"] += 1
+-                continue
+-            if skip_left > 0:
+-                skip_left -= 1
+-                stats["skipped"] += 1
+-                continue
+-            async with ctx["lock"]:
+-                if ctx.get("remaining") is not None:
+-                    if ctx["remaining"] <= 0:
+-                        ctx["limit_hit"] = True
+-                        break
+-                    ctx["remaining"] -= 1
+-            try:
+-                file_id = _pack_message_file(m)
+-            except Exception as e:  # noqa: BLE001
+-                stats["errors"] += 1
+-                log.debug("backfill pack failed msg %s: %s", m.id, e)
+-                continue
+-            if not file_id:
+-                stats["skipped"] += 1  # no file_reference on the document
+-                continue
+-            file_name = (_doc_file_name(doc) or "").strip()
+-            if not file_name and m.text:
+-                file_name = m.text.strip().split("\n")[0].strip()
+-            if not file_name:
+-                stats["skipped"] += 1
+-                continue
+-            file_name = file_name[:500]
+-            quality, language = detect_quality_language(file_name)
+-            caption = m.text or ""
+-            if len(caption) > 1024:
+-                caption = caption[:1020] + "..."
+-            meta = telethon_media_meta(doc)
+-            rows.append({
+-                "file_id": file_id,
+-                "file_name": file_name,
+-                "file_size": getattr(doc, "size", None),
+-                "mime_type": getattr(doc, "mime_type", None),
+-                "caption": caption or None,
+-                "channel_id": None,
+-                "message_id": None,
+-                "source_channel_id": src_id,
+-                "source_message_id": m.id,
+-                "quality": quality,
+-                "language": language,
+-                "title_key": title_key(file_name) or None,
+-                "width": meta["width"],
+-                "height": meta["height"],
+-                "duration": meta["duration"],
+-                "supports_streaming": meta["supports_streaming"],
+-                "posted_at": getattr(m, "date", None),
+-                "views": getattr(m, "views", None),
+-                "forwards": getattr(m, "forwards", None),
+-            })
+-            if len(rows) >= _DIRECT_BATCH:
+-                await flush()
+-        await flush()
+-        if done or ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-            break
+-        await asyncio.sleep(0.15)  # polite getHistory pacing
+-    await flush()
+-    return stats
+-
+-
+-def _pyro_raw_file_id(raw_doc) -> str | None:
+-    """Build a guaranteed-complete Pyrogram Bot API file_id directly from a
+-    raw MTProto Document object (pyrogram.raw.types.Document).
+-
+-    The high-level ``m.document.file_id`` can produce a truncated file_id
+-    when the in_memory Pyrogram bot client hasn't cached the peer's full
+-    access_hash. Going via the raw document fields avoids this entirely:
+-    Telegram ALWAYS sends dc_id, id, access_hash and file_reference in
+-    GetHistory responses — these fields are never partial.
+-    """
+-    try:
+-        from pyrogram.file_id import FileId, FileType
+-        from pyrogram import raw as pyro_raw
+-        if not isinstance(raw_doc, pyro_raw.types.Document):
+-            return None
+-        if not raw_doc.file_reference:
+-            return None
+-        fid = FileId(
+-            file_type=FileType.DOCUMENT,
+-            dc_id=raw_doc.dc_id,
+-            media_id=raw_doc.id,
+-            access_hash=raw_doc.access_hash,
+-            file_reference=bytes(raw_doc.file_reference),
+-        )
+-        return fid.encode()
+-    except Exception as e:  # noqa: BLE001
+-        log.debug("_pyro_raw_file_id failed: %s", e)
+-        return None
+-
+-
+-def _pyro_media(msg) -> dict | None:
+-    """Extract (file_id, file_name, file_size, mime_type, w, h, dur) from a
+-    Pyrogram message.
+-
+-    Builds the file_id from the RAW MTProto document fields (dc_id, id,
+-    access_hash, file_reference) so it is always complete and guaranteed
+-    to be accepted by the Bot API. The high-level m.document.file_id can be
+-    truncated when the in_memory bot client has an incomplete peer cache.
+-    """
+-    # Try to get the raw document from the message's _raw attribute first
+-    # (present on all Pyrogram messages received from Telegram).
+-    raw_msg = getattr(msg, "_raw", None)
+-    raw_media = getattr(raw_msg, "media", None) if raw_msg else None
+-    raw_doc = getattr(raw_media, "document", None) if raw_media else None
+-
+-    if raw_doc is not None:
+-        built_fid = _pyro_raw_file_id(raw_doc)
+-        if built_fid:
+-            # Gather metadata from the high-level object where available
+-            for attr in ("document", "video", "audio", "animation", "voice",
+-                         "video_note", "sticker"):
+-                hi = getattr(msg, attr, None)
+-                if hi is not None:
+-                    return {
+-                        "file_id": built_fid,
+-                        "file_name": getattr(hi, "file_name", None),
+-                        "file_size": getattr(hi, "file_size", None),
+-                        "mime_type": getattr(hi, "mime_type", None),
+-                        "width": getattr(hi, "width", None),
+-                        "height": getattr(hi, "height", None),
+-                        "duration": getattr(hi, "duration", None),
+-                    }
+-            # Fallback: gather metadata from raw document
+-            return {
+-                "file_id": built_fid,
+-                "file_name": None,
+-                "file_size": getattr(raw_doc, "size", None),
+-                "mime_type": getattr(raw_doc, "mime_type", None),
+-                "width": None,
+-                "height": None,
+-                "duration": None,
+-            }
+-
+-    # Fallback: use the high-level file_id (may be partial for some edge cases)
+-    for attr in ("document", "video", "audio", "animation", "voice",
+-                 "video_note", "sticker", "photo"):
+-        m = getattr(msg, attr, None)
+-        if m is not None:
+-            fid = getattr(m, "file_id", None)
+-            if not fid:
+-                continue
+-            log.debug("_pyro_media: using fallback high-level file_id for %s", attr)
+-            return {
+-                "file_id": fid,
+-                "file_name": getattr(m, "file_name", None),
+-                "file_size": getattr(m, "file_size", None),
+-                "mime_type": getattr(m, "mime_type", None),
+-                "width": getattr(m, "width", None),
+-                "height": getattr(m, "height", None),
+-                "duration": getattr(m, "duration", None),
+-            }
+-    return None
+-
+-
+-async def _walk_job_direct_pyro(client, factory, job: dict,
+-                                ctx: dict) -> dict:
+-    """Walk one job newest->oldest using Pyrogram (bot session).
+-
+-    This is EXACTLY how Tech VJ does it: Pyrogram bot client reads history,
+-    ``message.document.file_id`` is already the correct Bot API file_id.
+-    No manual packing, no format guessing.
+-    """
+-    from pyrogram.errors import FloodWait
+-    from app.services.textutil import detect_quality_language, title_key
+-
+-    stats = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0, "errors": 0}
+-    # Resolve channel: prefer the original ref (username/link), else the id.
+-    ref = job["channel_ref"]
+-    try:
+-        chat = await client.get_chat(ref)
+-    except Exception:  # noqa: BLE001
+-        chat = await client.get_chat(job["channel_id"])
+-    src_id = job["channel_id"]
+-    offset_id = job["offset_id"] or job["max_id"] or 0
+-    skip_left = max(0, job["skip"])
+-    rows: list[dict] = []
+-    fw_streak = 0
+-
+-    async def flush() -> None:
+-        if not rows:
+-            return
+-        try:
+-            saved, dupes = await _bulk_save_files(factory, rows)
+-            stats["saved"] += saved
+-            stats["dupes"] += dupes
+-        except Exception as e:  # noqa: BLE001
+-            stats["errors"] += len(rows)
+-            log.warning("backfill bulk save failed (%d rows): %s",
+-                        len(rows), e)
+-        rows.clear()
+-        await _save_job(factory, job["id"], offset_id=offset_id,
+-                        stats=dict(stats))
+-
+-    while True:
+-        if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-            break
+-        try:
+-            batch = [m async for m in client.get_chat_history(
+-                chat.id, limit=200, offset_id=offset_id or None)]
+-        except FloodWait as e:
+-            fw_streak += 1
+-            wait = e.value + 5
+-            log.warning("backfill FloodWait %ss (job %s), sleeping %ss",
+-                        e.value, job["id"], wait)
+-            await flush()
+-            await asyncio.sleep(wait)
+-            if fw_streak >= _FW_COOLDOWN_AFTER:
+-                await asyncio.sleep(_FW_COOLDOWN_SECS)
+-                fw_streak = 0
+-            continue
+-        except Exception as e:  # noqa: BLE001
+-            log.exception("backfill iterate error (job %s): %s", job["id"], e)
+-            stats["errors"] += 1
+-            await flush()
+-            await _save_job(factory, job["id"], offset_id=offset_id,
+-                            stats=dict(stats), status="error",
+-                            error=str(e)[:500])
+-            return stats
+-        if not batch:
+-            break
+-        fw_streak = 0
+-        done = False
+-        for m in batch:
+-            stats["scanned"] += 1
+-            offset_id = m.id
+-            if job["min_id"] and m.id < job["min_id"]:
+-                done = True
+-                break
+-            if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-                break
+-            media = _pyro_media(m)
+-            if not media or not media["file_id"]:
+-                stats["skipped"] += 1
+-                continue
+-            if skip_left > 0:
+-                skip_left -= 1
+-                stats["skipped"] += 1
+-                continue
+-            async with ctx["lock"]:
+-                if ctx.get("remaining") is not None:
+-                    if ctx["remaining"] <= 0:
+-                        ctx["limit_hit"] = True
+-                        break
+-                    ctx["remaining"] -= 1
+-            file_name = (media["file_name"] or "").strip()
+-            caption_text = (m.caption or "").strip()
+-            if not file_name and caption_text:
+-                file_name = caption_text.split("\n")[0].strip()
+-            if not file_name:
+-                stats["skipped"] += 1
+-                continue
+-            file_name = file_name[:500]
+-            quality, language = detect_quality_language(file_name)
+-            if len(caption_text) > 1024:
+-                caption_text = caption_text[:1020] + "..."
+-            rows.append({
+-                "file_id": media["file_id"],
+-                "file_name": file_name,
+-                "file_size": media["file_size"],
+-                "mime_type": media["mime_type"],
+-                "caption": caption_text or None,
+-                "channel_id": None,
+-                "message_id": None,
+-                "source_channel_id": src_id,
+-                "source_message_id": m.id,
+-                "quality": quality,
+-                "language": language,
+-                "title_key": title_key(file_name) or None,
+-                "width": media["width"],
+-                "height": media["height"],
+-                "duration": media["duration"],
+-                "supports_streaming": None,
+-                "posted_at": getattr(m, "date", None),
+-                "views": getattr(m, "views", None),
+-                "forwards": getattr(m, "forwards", None),
+-            })
+-            if len(rows) >= _DIRECT_BATCH:
+-                await flush()
+-        await flush()
+-        # Respect max_id upper bound
+-        if job["max_id"] and offset_id > job["max_id"]:
+-            pass  # get_chat_history goes newest->oldest; max_id handled below
+-        if done or ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-            break
+-        await asyncio.sleep(0.15)
+-    await flush()
+-    return stats
+-
+-
+-# ------------------------- forward-mode walker -------------------------
+-
+-async def _walk_job_forward(client, factory, job: dict, ctx: dict) -> dict:
+-    """Walk one job newest->oldest, forwarding media to the bot.
+-
+-    Proven fallback (BACKFILL_MODE=forward): every file arrives at the bot
+-    as a PM and is indexed with a Bot-API-issued file_id. Forwards go out
+-    in bulk batches (BACKFILL_BATCH per API call) — roughly 15-30 files/sec
+-    per worker, with FloodWait backoff for safety.
+-    """
+-    from telethon.errors import FloodWaitError
+-
+-    stats = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0, "errors": 0}
+-    channel = await client.get_entity(_entity_ref(job["channel_ref"]))
+-    src_id = job["channel_id"]
+-    offset_id = job["offset_id"] or job["max_id"] or 0
+-    skip_left = max(0, job["skip"])
+-    delay = ctx["delay"]
+-    bot_peer = ctx["bot_username"]
+-    fw_streak = 0
+-    since_checkpoint = 0
+-
+-    async def checkpoint() -> None:
+-        await _save_job(factory, job["id"], offset_id=offset_id,
+-                        stats=dict(stats))
+-
+-    while True:
+-        if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-            break
+-        try:
+-            batch = [m async for m in client.iter_messages(
+-                channel, limit=200, offset_id=offset_id or None,
+-                max_id=job["max_id"] or None)]
+-        except FloodWaitError as e:
+-            fw_streak += 1
+-            wait = e.seconds + 5
+-            log.warning("backfill iterate FloodWait %ss (job %s), sleeping %ss",
+-                        e.seconds, job["id"], wait)
+-            await asyncio.sleep(wait)
+-            if fw_streak >= _FW_COOLDOWN_AFTER:
+-                log.warning("backfill job %s: %d consecutive FloodWaits, "
+-                            "cooling down %ss", job["id"], fw_streak,
+-                            _FW_COOLDOWN_SECS)
+-                await asyncio.sleep(_FW_COOLDOWN_SECS)
+-                fw_streak = 0
+-            continue
+-        except Exception as e:  # noqa: BLE001
+-            log.exception("backfill iterate error (job %s): %s", job["id"], e)
+-            stats["errors"] += 1
+-            await _save_job(factory, job["id"], offset_id=offset_id,
+-                            stats=dict(stats), status="error",
+-                            error=str(e)[:500])
+-            return stats
+-        if not batch:
+-            break
+-
+-        cands = []
+-        for m in batch:
+-            stats["scanned"] += 1
+-            if job["min_id"] and m.id < job["min_id"]:
+-                cands_done = True
+-                break
+-            media = m.document or m.video or m.audio
+-            if not m.media or media is None:
+-                stats["skipped"] += 1
+-                offset_id = m.id
+-                continue
+-            cands.append((m.id, m))
+-        else:
+-            cands_done = False
+-
+-        done_ids = await _already_indexed(factory, src_id,
+-                                          [i for i, _ in cands])
+-        # Filter to fresh messages, honoring skip/limit, then bulk-forward
+-        # in batches: one API call per batch instead of one per file.
+-        fresh = []
+-        for mid, m in cands:
+-            if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-                break
+-            if mid in done_ids:
+-                stats["dupes"] += 1
+-                stats["skipped"] += 1
+-                offset_id = mid
+-                continue
+-            if skip_left > 0:
+-                skip_left -= 1
+-                stats["skipped"] += 1
+-                offset_id = mid
+-                continue
+-            async with ctx["lock"]:
+-                if ctx.get("remaining") is not None:
+-                    if ctx["remaining"] <= 0:
+-                        ctx["limit_hit"] = True
+-                        break
+-                    ctx["remaining"] -= 1
+-            fresh.append(mid)
+-        batch_size = max(1, int(ctx.get("batch_size", 30)))
+-        for i in range(0, len(fresh), batch_size):
+-            if ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-                break
+-            chunk = fresh[i:i + batch_size]
+-            try:
+-                await client.forward_messages(bot_peer, chunk,
+-                                              from_peer=channel)
+-                stats["saved"] += len(chunk)
+-                fw_streak = 0
+-                since_checkpoint += len(chunk)
+-                offset_id = chunk[-1]  # newest->oldest: last = oldest id
+-                await asyncio.sleep(delay + random.uniform(0, 0.5))
+-            except FloodWaitError as e:
+-                fw_streak += 1
+-                wait = e.seconds + 5
+-                log.warning("backfill forward FloodWait %ss (job %s), "
+-                            "sleeping %ss", e.seconds, job["id"], wait)
+-                await _save_job(factory, job["id"], offset_id=offset_id,
+-                                stats=dict(stats))
+-                if fw_streak >= _FW_COOLDOWN_AFTER:
+-                    log.warning("backfill job %s cooling down %ss",
+-                                job["id"], _FW_COOLDOWN_SECS)
+-                    await asyncio.sleep(_FW_COOLDOWN_SECS)
+-                    fw_streak = 0
+-                else:
+-                    await asyncio.sleep(wait)
+-                break
+-            except Exception as e:  # noqa: BLE001
+-                stats["errors"] += 1
+-                log.warning("backfill forward failed chunk %s..%s: %s",
+-                            chunk[0], chunk[-1], e)
+-            if since_checkpoint >= _CHECKPOINT_EVERY:
+-                since_checkpoint = 0
+-                await checkpoint()
+-        if cands_done or ctx["cancel"].is_set() or ctx.get("limit_hit"):
+-            break
+-
+-    await checkpoint()
+-    return stats
+-
+-
+-async def _worker(wid: int, client, factory, run_token: str,
+-                  ctx: dict, walker) -> dict:
+-    """Claim and walk jobs until none are left, cancelled, or limit hit."""
+-    totals = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0,
+-              "errors": 0, "jobs": 0}
+-    while not ctx["cancel"].is_set() and not ctx.get("limit_hit"):
+-        job = await _claim_job(factory, run_token, wid)
+-        if job is None:
+-            break
+-        log.info("backfill worker %d claimed job %s (%s %s-%s)", wid,
+-                 job["id"], job["channel_ref"], job["min_id"], job["max_id"])
+-        try:
+-            stats = await walker(client, factory, job, ctx)
+-        except asyncio.CancelledError:
+-            raise
+-        except Exception as exc:  # noqa: BLE001
+-            # Never let one bad job kill the whole run: record it and move on.
+-            log.exception("backfill worker %d job %s crashed: %s",
+-                          wid, job["id"], exc)
+-            stats = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0,
+-                     "errors": 1}
+-            await _save_job(factory, job["id"], status="error",
+-                            error=str(exc)[:500], stats=dict(stats))
+-        for k in totals:
+-            if k in stats:
+-                totals[k] += stats[k]
+-        totals["jobs"] += 1
+-        final = ("cancelled" if ctx["cancel"].is_set()
+-                 else "done")
+-        await _save_job(factory, job["id"], status=final,
+-                        stats=dict(stats))
+-    return totals
+-
+-
+-async def run_backfill(run_token: str, bot_username: str,
+-                       cancel_event: asyncio.Event,
+-                       progress_cb=None, limit: int = 0) -> dict:
+-    """Run all pending jobs for a run with one worker per session.
+-
+-    Mode comes from BACKFILL_MODE ("direct" default, "forward" fallback).
+-    Returns aggregate totals. progress_cb(agg) is called ~every 5s.
+-    """
+-    from app.config import settings
+-    from app.db import get_session_factory
+-
+-    mode = backfill_mode()
+-    # Bot mode + direct: use Pyrogram (Tech VJ method) — file_id comes
+-    # straight from Pyrogram, no manual packing.
+-    if mode == "direct" and settings.INDEXER_BOT_MODE:
+-        walker = _walk_job_direct_pyro
+-        clients = [await get_pyro_client()]
+-    else:
+-        walker = _walk_job_direct if mode == "direct" else _walk_job_forward
+-        clients = await get_clients()
+-    factory = get_session_factory(settings.DATABASE_URL)
+-    ctx = {
+-        "cancel": cancel_event,
+-        "lock": asyncio.Lock(),
+-        # inter-batch delay for forward mode (bulk); direct mode ignores it
+-        "delay": max(1.0, float(settings.BACKFILL_DELAY)),
+-        "batch_size": max(1, int(settings.BACKFILL_BATCH)),
+-        "bot_username": bot_username,
+-        "remaining": limit or None,
+-        "mode": mode,
+-    }
+-    workers = [asyncio.create_task(_worker(i, c, factory, run_token, ctx,
+-                                          walker))
+-               for i, c in enumerate(clients)]
+-    log.info("backfill run %s: %d worker(s), mode=%s", run_token,
+-             len(workers), mode)
+-
+-    async def pump_progress() -> None:
+-        while any(not w.done() for w in workers):
+-            await asyncio.sleep(5)
+-            if progress_cb:
+-                try:
+-                    await progress_cb(await backfill_stats(run_token))
+-                except Exception:  # noqa: BLE001
+-                    pass
+-
+-    pump = asyncio.create_task(pump_progress())
+-    results = await asyncio.gather(*workers)
+-    pump.cancel()
+-    try:
+-        await pump
+-    except asyncio.CancelledError:
+-        pass
+-    totals = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0,
+-              "errors": 0, "jobs": 0, "workers": len(workers),
+-              "mode": mode,
+-              "cancelled": cancel_event.is_set(),
+-              "limit_hit": bool(ctx.get("limit_hit"))}
+-    for r in results:
+-        for k in ("scanned", "saved", "skipped", "dupes", "errors", "jobs"):
+-            totals[k] += r.get(k, 0)
+-    if progress_cb:
+-        try:
+-            await progress_cb(await backfill_stats(run_token))
+-        except Exception:  # noqa: BLE001
+-            pass
+-    return totals
+-
+-
+-async def backfill_stats(run_token: str) -> dict:
+-    """Aggregate job stats for a run, from the DB."""
+-    from sqlalchemy import select
+-    from app.config import settings
+-    from app.db import get_session_factory
+-    from app.models import BackfillJob
+-
+-    factory = get_session_factory(settings.DATABASE_URL)
+-    agg = {"scanned": 0, "saved": 0, "skipped": 0, "dupes": 0,
+-           "errors": 0, "pending": 0, "running": 0, "done": 0,
+-           "cancelled": 0, "error": 0, "total": 0, "titles": [],
+-           "last_error": "", "mode": backfill_mode()}
+-    async with factory() as session:
+-        rows = (await session.execute(
+-            select(BackfillJob.status, BackfillJob.stats,
+-                   BackfillJob.channel_title, BackfillJob.error)
+-            .where(BackfillJob.run_token == run_token)
+-            .order_by(BackfillJob.id)
+-        )).all()
+-    for status, stats, title, error in rows:
+-        agg["total"] += 1
+-        agg[status] = agg.get(status, 0) + 1
+-        for k in ("scanned", "saved", "skipped", "dupes", "errors"):
+-            agg[k] += (stats or {}).get(k, 0)
+-        if title and title not in agg["titles"]:
+-            agg["titles"].append(title)
+-        if error and not agg["last_error"]:
+-            agg["last_error"] = str(error)[:200]
+-    return agg
+-
+-
+-async def job_errors(run_token: str, limit: int = 3) -> list[dict]:
+-    """Most recent job errors for a run (for the status card)."""
+-    from sqlalchemy import select
+-    from app.config import settings
+-    from app.db import get_session_factory
+-    from app.models import BackfillJob
+-
+-    factory = get_session_factory(settings.DATABASE_URL)
+-    async with factory() as session:
+-        rows = (await session.execute(
+-            select(BackfillJob.channel_title, BackfillJob.error)
+-            .where(BackfillJob.run_token == run_token,
+-                   BackfillJob.error.isnot(None))
+-            .order_by(BackfillJob.id.desc())
+-            .limit(limit)
+-        )).all()
+-    return [{"title": t, "error": e} for t, e in rows]
+-
+-
+-async def cancel_run(run_token: str) -> None:
+-    """Mark pending/running jobs of a run as cancelled."""
+-    from sqlalchemy import update
+-    from app.config import settings
+-    from app.db import get_session_factory
+-    from app.models import BackfillJob
+-
+-    factory = get_session_factory(settings.DATABASE_URL)
+-    async with factory() as session:
+-        await session.execute(
+-            update(BackfillJob)
+-            .where(BackfillJob.run_token == run_token,
+-                   BackfillJob.status.in_(["pending", "running"]))
+-            .values(status="cancelled")
+-        )
+-        await session.commit()
