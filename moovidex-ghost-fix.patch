@@ -1,0 +1,105 @@
+diff --git a/app/handlers/index.py b/app/handlers/index.py
+index 60e965b..6cec715 100644
+--- a/app/handlers/index.py
++++ b/app/handlers/index.py
+@@ -422,9 +422,32 @@ async def index_command(update: Update, context) -> None:
+     if args and args[0].lower() == "cancel":
+         job_id = await bf.get_active_job_id()
+         if not job_id:
+-            await msg.reply_text("No active backfill job.")
++            # Check for orphaned jobs and force-clear them
++            from app.db import get_session_factory
++            from app.config import settings
++            from app.models import BackfillJob
++            from sqlalchemy import select, update
++            factory = get_session_factory(settings.DATABASE_URL)
++            async with factory() as s:
++                orphan = (await s.execute(
++                    select(BackfillJob.id)
++                    .where(BackfillJob.status == "running")
++                    .order_by(BackfillJob.id.desc())
++                    .limit(1)
++                )).scalar_one_or_none()
++                if orphan:
++                    await s.execute(
++                        update(BackfillJob)
++                        .where(BackfillJob.id == orphan)
++                        .values(status="aborted",
++                                error="force-aborted: stuck job cleared"))
++                    await s.commit()
++                    await msg.reply_text(f"🧹 Cleared stuck job #{orphan}. "
++                                         "You can start a new backfill now.")
++                else:
++                    await msg.reply_text("No active backfill job.")
+             return
+-        if bf.request_cancel(job_id):
++        if await bf.force_abort_job(job_id):
+             await msg.reply_text(f"🛑 Cancel requested for job #{job_id}. "
+                                  "Finishing current batch…")
+         else:
+diff --git a/app/services/backfill.py b/app/services/backfill.py
+index 5fd0e20..9a1aada 100644
+--- a/app/services/backfill.py
++++ b/app/services/backfill.py
+@@ -148,6 +148,11 @@ def is_running(job_id: int) -> bool:
+ 
+ 
+ async def get_active_job_id() -> int | None:
++    """Return the running job id, or None.
++
++    Self-healing: if DB says "running" but no live task exists
++    (bot restarted/crashed), mark it aborted and return None.
++    """
+     from app.db import get_session_factory
+     from app.config import settings
+     from app.models import BackfillJob
+@@ -155,13 +160,46 @@ async def get_active_job_id() -> int | None:
+ 
+     factory = get_session_factory(settings.DATABASE_URL)
+     async with factory() as s:
+-        row = (await s.execute(
+-            select(BackfillJob.id)
++        job = (await s.execute(
++            select(BackfillJob)
+             .where(BackfillJob.status == "running")
+             .order_by(BackfillJob.id.desc())
+             .limit(1)
+         )).scalar_one_or_none()
+-        return row
++        if not job:
++            return None
++        task = _tasks.get(job.id)
++        if task is None or task.done():
++            # Orphaned — no live task. Clean up.
++            job.status = "aborted"
++            job.error = "orphaned: bot restarted or job crashed"
++            await s.commit()
++            _tasks.pop(job.id, None)
++            _cancel_events.pop(job.id, None)
++            log.info("Cleaned up orphaned job #%d", job.id)
++            return None
++        return job.id
++
++
++async def force_abort_job(job_id: int) -> bool:
++    """Mark a job aborted in DB (for orphaned/stuck jobs)."""
++    from app.db import get_session_factory
++    from app.config import settings
++    from app.models import BackfillJob
++
++    # Try graceful cancel first
++    if request_cancel(job_id):
++        return True
++    # No live task — force DB update
++    factory = get_session_factory(settings.DATABASE_URL)
++    async with factory() as s:
++        job = await s.get(BackfillJob, job_id)
++        if job and job.status == "running":
++            job.status = "aborted"
++            job.error = "force-aborted by admin"
++            await s.commit()
++            return True
++        return False
+ 
+ 
+ async def _save_progress(job_id: int, prog: JobProgress,

@@ -422,9 +422,32 @@ async def index_command(update: Update, context) -> None:
     if args and args[0].lower() == "cancel":
         job_id = await bf.get_active_job_id()
         if not job_id:
-            await msg.reply_text("No active backfill job.")
+            # Check for orphaned jobs and force-clear them
+            from app.db import get_session_factory
+            from app.config import settings
+            from app.models import BackfillJob
+            from sqlalchemy import select, update
+            factory = get_session_factory(settings.DATABASE_URL)
+            async with factory() as s:
+                orphan = (await s.execute(
+                    select(BackfillJob.id)
+                    .where(BackfillJob.status == "running")
+                    .order_by(BackfillJob.id.desc())
+                    .limit(1)
+                )).scalar_one_or_none()
+                if orphan:
+                    await s.execute(
+                        update(BackfillJob)
+                        .where(BackfillJob.id == orphan)
+                        .values(status="aborted",
+                                error="force-aborted: stuck job cleared"))
+                    await s.commit()
+                    await msg.reply_text(f"🧹 Cleared stuck job #{orphan}. "
+                                         "You can start a new backfill now.")
+                else:
+                    await msg.reply_text("No active backfill job.")
             return
-        if bf.request_cancel(job_id):
+        if await bf.force_abort_job(job_id):
             await msg.reply_text(f"🛑 Cancel requested for job #{job_id}. "
                                  "Finishing current batch…")
         else:
