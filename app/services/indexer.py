@@ -80,10 +80,32 @@ async def resolve_channel(ref: str) -> dict:
     """Resolve ref -> {ref, chat_id, title, last_msg_id}. Raises on error."""
     client = await get_client()
     ref = parse_channel_ref(ref)
+
+    # Populate peer cache first (in-memory session starts empty —
+    # without this, get_chat on a -100 id throws "Peer id invalid").
     try:
-        chat = await client.get_chat(ref)
-    except Exception:
-        chat = await client.get_chat(int(ref))
+        async for _ in client.get_dialogs(limit=50):
+            break
+    except Exception:  # noqa: BLE001
+        pass
+
+    chat = None
+    last_err = None
+    for attempt in (ref,):
+        try:
+            chat = await client.get_chat(attempt)
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    if chat is None:
+        try:
+            chat = await client.get_chat(int(ref))
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    if chat is None:
+        raise RuntimeError(
+            f"Peer id invalid: {ref}. Bot must be a MEMBER of the channel "
+            f"(add it first, then retry). Details: {last_err}")
     last = 0
     async for m in client.get_chat_history(chat.id, limit=1):
         last = m.id
