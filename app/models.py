@@ -191,3 +191,32 @@ class Group(Base):
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
     )
+
+
+class BackfillJob(Base):
+    """Backfill job state — resumable, survives bot restarts."""
+
+    __tablename__ = "backfill_jobs"
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
+    channel_ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    channel_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    title: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    status: Mapped[str] = mapped_column(sa.Text, nullable=False, default="pending")
+    # pending, running, done, aborted, error
+    skip: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
+    min_id: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
+    max_id: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
+    resume_msg_id: Mapped[int | None] = mapped_column(sa.BigInteger, nullable=True)
+    """Message ID to resume from (exclusive). None = start from max_id/latest."""
+    scanned: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
+    forwarded: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
+    errors: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, default=0)
+    error_msg: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(),
+        onupdate=sa.func.now(), nullable=False
+    )

@@ -27,6 +27,7 @@ from telegram.ext import Application
 
 from app.config import settings
 from app.db import get_session_factory
+from app.handlers.common import admin_only
 from app.models import File
 from app.services.textutil import (
     detect_quality_language,
@@ -274,9 +275,140 @@ async def _finalize_index_summary(bot, chat_id: int, chat_data: dict) -> None:
         pass
 
 
+
+
+# ------------------------------------------------------- /index backfill ---
+# User-session backfill for OLD channel history.
+# Bots cannot read history (BOT_METHOD_INVALID) — a Pyrogram user session
+# (TG_SESSION) walks the channel and bulk-forwards media to the dump
+# channel, where the bot's own auto-index saves native Bot API file_ids.
+
+def _parse_index_args(args: list[str]) -> tuple[str, int, int, int]:
+    """Parse: <channel> [skip=N] [from=ID] [to=ID]."""
+    channel = args[0] if args else ""
+    skip, min_id, max_id = 0, 0, 0
+    for a in args[1:]:
+        low = a.lower()
+        try:
+            if low.startswith("skip="):
+                skip = max(0, int(low.split("=", 1)[1]))
+            elif low.startswith("from="):
+                min_id = max(0, int(low.split("=", 1)[1]))
+            elif low.startswith("to="):
+                max_id = max(0, int(low.split("=", 1)[1]))
+        except ValueError:
+            pass
+    return channel, skip, min_id, max_id
+
+
+@admin_only
+async def index_command(update: Update, context) -> None:
+    """Start / monitor / cancel a backfill job.
+
+    /index @channel [skip=N] [from=ID] [to=ID]  — start (resumable)
+    /index                                      — show active job
+    /index cancel                               — abort active job
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from app.services import backfill as bf
+
+    msg = update.effective_message
+    args = context.args or []
+
+    # --- cancel ---
+    if args and args[0].lower() == "cancel":
+        job_id = await bf.get_active_job_id()
+        if not job_id:
+            await msg.reply_text("No active backfill job.")
+            return
+        if bf.request_cancel(job_id):
+            await msg.reply_text(f"🛑 Cancel requested for job #{job_id}. "
+                                 "Finishing current batch…")
+        else:
+            await msg.reply_text(f"Job #{job_id} is not responding to cancel.")
+        return
+
+    # --- status ---
+    if not args:
+        job_id = await bf.get_active_job_id()
+        if not job_id:
+            await msg.reply_text(
+                "No active backfill job.\n\n"
+                "Usage:\n"
+                "<code>/index @channel</code> — start\n"
+                "<code>/index @channel skip=1000 from=5000 to=90000</code>\n"
+                "<code>/index cancel</code> — abort",
+                parse_mode="HTML")
+            return
+        await msg.reply_text(f"Job #{job_id} is running. Live progress "
+                             "updates appear on its progress message.")
+        return
+
+    # --- start (only one at a time) ---
+    if await bf.get_active_job_id():
+        await msg.reply_text("⚠️ A backfill job is already running. "
+                             "Use <code>/index cancel</code> first.",
+                             parse_mode="HTML")
+        return
+
+    channel, skip, min_id, max_id = _parse_index_args(args)
+    if not channel:
+        await msg.reply_text("Usage: <code>/index @channel [skip=N] "
+                             "[from=ID] [to=ID]</code>", parse_mode="HTML")
+        return
+
+    job_id = await bf.create_job(channel, skip=skip,
+                                 min_id=min_id, max_id=max_id)
+    status_msg = await msg.reply_text(
+        f"🚀 Backfill job #{job_id} starting…\n"
+        f"Channel: <code>{channel}</code>\n"
+        f"skip={skip} from={min_id or '…'} to={max_id or 'latest'}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Cancel", callback_data=f"bfcancel:{job_id}")
+        ]]))
+
+    async def _cb(prog, final=False, error=None):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=status_msg.chat_id, message_id=status_msg.message_id,
+                text=bf.format_progress(prog, final=final, error=error),
+                parse_mode="HTML",
+                reply_markup=None if final else InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🛑 Cancel",
+                                         callback_data=f"bfcancel:{job_id}")
+                ]]))
+        except Exception:  # noqa: BLE001
+            pass  # message deleted / not modified — job continues
+
+    bf.launch(job_id, _cb)
+
+
+@admin_only
+async def backfill_cancel_button(update: Update, context) -> None:
+    """Inline 🛑 Cancel button on the progress message."""
+    from app.services import backfill as bf
+
+    q = update.callback_query
+    await q.answer()
+    try:
+        job_id = int(q.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return
+    if bf.request_cancel(job_id):
+        await q.edit_message_text(f"🛑 Cancel requested for job #{job_id}.")
+    else:
+        await q.edit_message_text(f"Job #{job_id} already finished.")
+
+
 def register(application: Application) -> None:
-    """Register auto-index handlers (no backfill)."""
-    from telegram.ext import MessageHandler, filters
+    """Register auto-index + backfill handlers."""
+    from telegram.ext import (CallbackQueryHandler, CommandHandler,
+                              MessageHandler, filters)
+    # /index backfill (admin only, via @admin_only inside)
+    application.add_handler(CommandHandler("index", index_command))
+    application.add_handler(CallbackQueryHandler(
+        backfill_cancel_button, pattern=r"^bfcancel:"))
     # Channel posts -> auto-index new files
     application.add_handler(MessageHandler(
         filters.UpdateType.CHANNEL_POST, on_channel_post))
